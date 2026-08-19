@@ -54,7 +54,7 @@ def test_auth_recovery_runs_sessions_flow_then_rechecks(monkeypatch):
             calls.append(("verify", command, timeout))
             return Result()
 
-    monkeypatch.setattr(wizard, "authenticate_available", lambda: available["value"])
+    monkeypatch.setattr(wizard, "authenticate_available", lambda home=None: available["value"])
     wizard.ensure_colab_auth(interactive=True, input_fn=lambda _: "y", cli=FakeCLI())
     assert calls == ["interactive", "sessions-command", ("verify", ["colab", "sessions"], 60)]
 

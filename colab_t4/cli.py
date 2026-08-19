@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -11,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
+from .accounts import account_home_dir, add_account, get_account, load_accounts, next_account_id, remove_account, resolve_account_email
 from .backend import ColabCLI, ColabCLIError
 from .config import load_secrets, load_state, logs_dir, redact, save_runtime_api_key
 from .notebook import DEFAULT_CTX, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
@@ -19,7 +21,7 @@ from .lifecycle import down as lifecycle_down
 from .lifecycle import restart as lifecycle_restart
 from .lifecycle import up as lifecycle_up
 from .lifecycle import wait as lifecycle_wait
-from .wizard import collect, configure_status, ensure_colab_auth, interactive_available, persist, reset
+from .wizard import _auth_ok, collect, configure_status, ensure_colab_auth, interactive_available, persist, reset
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -80,6 +82,7 @@ def _status() -> tuple[dict, int]:
     result: dict[str, object] = {
         "runtime_state": state.get("runtime_state", "unknown"),
         "session": state.get("session"),
+        "account": state.get("account"),
         "gpu": state.get("gpu"),
         "accelerator": state.get("accelerator"),
         "notebook_execution": state.get("runtime_state"),
@@ -107,6 +110,7 @@ def print_status(result: dict, as_json: bool) -> None:
         return
     print(f"runtime : {result.get('runtime_state')}")
     print(f"session : {result.get('session') or '-'}")
+    print(f"account : {result.get('account') or '-'}")
     print(f"gpu     : {result.get('gpu') or result.get('accelerator') or '-'}")
     ts = result.get("tailscale") or {}
     print(f"tailscale: {ts.get('ip') or '-'}")
@@ -183,7 +187,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     interactive = interactive_available(getattr(args, "interactive", False)) and not getattr(args, "non_interactive", False)
     try:
         cli = ColabCLI.discover()
-        ensure_colab_auth(interactive=interactive, cli=cli)
+        if interactive:
+            ensure_colab_auth(interactive=True, cli=cli)
         values = collect(args, force=False, allow_prompt=interactive)
         for key, value in values.items():
             setattr(args, key, value)
@@ -300,6 +305,110 @@ def cmd_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def _accounts_list(args: argparse.Namespace) -> int:
+    accounts = load_accounts()
+    state = load_state()
+    active = state.get("account")
+    rows = []
+    for account in accounts:
+        if account.last_error:
+            status = "error: " + account.last_error[:60]
+        elif account.last_ok:
+            status = "ok"
+        else:
+            status = "unused"
+        rows.append({
+            "id": account.id,
+            "email": account.email or "unknown",
+            "home": account.home or "(default home)",
+            "active": account.id == active,
+            "status": status,
+            "last_used": account.last_used_at or "-",
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no accounts")
+        return 0
+    for row in rows:
+        marker = "*" if row["active"] else " "
+        print(f"{marker}{row['id']:<16} {row['email']:<32} {row['status']:<70} home={row['home']}")
+    print("(* = account hosting the recorded runtime)")
+    return 0
+
+
+def _accounts_add(args: argparse.Namespace) -> int:
+    if not interactive_available(False):
+        fail("accounts add requires a TTY for the interactive OAuth flow")
+    account_id = args.id or next_account_id()
+    if account_id == "default":
+        fail("'default' is the implicit legacy account; choose a different id")
+    home_dir = account_home_dir(account_id)
+    try:
+        home_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        fail(f"an account directory for '{account_id}' already exists; pick a different --id")
+    cli = ColabCLI.discover(home=str(home_dir))
+    print(f"Adding account '{account_id}' (isolated credentials under {home_dir}).")
+    print("The Colab CLI will print an authorization URL. Open it in a browser, sign in")
+    print("as the Google account to add, approve access, then paste the code back here.")
+    try:
+        result = cli.run_interactive_auth()
+    except (EOFError, KeyboardInterrupt):
+        shutil.rmtree(home_dir, ignore_errors=True)
+        print("Authentication cancelled; no account was added.", file=sys.stderr)
+        return 130
+    if result != 0:
+        shutil.rmtree(home_dir, ignore_errors=True)
+        fail("Colab CLI authentication flow failed; no account was added")
+    ok, reason = _auth_ok(cli, str(home_dir))
+    if not ok:
+        shutil.rmtree(home_dir, ignore_errors=True)
+        fail("authentication verification failed: " + reason)
+    email = resolve_account_email(str(home_dir)) or args.email or ""
+    add_account(account_id, home=str(home_dir), email=email)
+    print(f"account '{account_id}' added{(' (' + email + ')') if email else ' (email unknown)'}")
+    print("The account is now part of the automatic failover rotation.")
+    return 0
+
+
+def _accounts_remove(args: argparse.Namespace) -> int:
+    try:
+        account = get_account(args.account)
+    except KeyError as exc:
+        fail(str(exc))
+    if not args.yes:
+        if not interactive_available(False):
+            fail("accounts remove requires confirmation; pass --yes")
+        try:
+            answer = input(f"Remove account '{account.id}'? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("Removal cancelled.", file=sys.stderr)
+            return 130
+        if answer not in {"y", "yes"}:
+            print("Removal cancelled.")
+            return 130
+    try:
+        remove_account(account.id)
+    except ValueError as exc:
+        fail(str(exc))
+    if account.home:
+        shutil.rmtree(account.home, ignore_errors=True)
+    print(f"account '{account.id}' removed")
+    return 0
+
+
+def cmd_accounts(args: argparse.Namespace) -> int:
+    if args.accounts_command == "list":
+        return _accounts_list(args)
+    if args.accounts_command == "add":
+        return _accounts_add(args)
+    if args.accounts_command == "remove":
+        return _accounts_remove(args)
+    return 1
+
+
 def _api_action_parser(sub):
     api = sub.add_parser("api", help="exercise or print the authenticated API")
     api.add_argument("action", nargs="?", choices=["models", "chat"], default=None)
@@ -358,6 +467,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--interactive", action="store_true")
     sub.add_parser("ssh", help="forward SSH options and remote commands")
+    accounts = sub.add_parser("accounts", help="manage Google Colab account profiles (failover rotation)")
+    accounts_sub = accounts.add_subparsers(dest="accounts_command", required=True)
+    accounts_list = accounts_sub.add_parser("list", help="list account profiles")
+    accounts_list.add_argument("--json", action="store_true")
+    accounts_add = accounts_sub.add_parser("add", help="add an account via the interactive Colab OAuth flow")
+    accounts_add.add_argument("--id")
+    accounts_add.add_argument("--email")
+    accounts_remove = accounts_sub.add_parser("remove", help="remove an account profile")
+    accounts_remove.add_argument("account")
+    accounts_remove.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -366,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "ssh":
         return cmd_ssh(argv[1:])
     args = build_parser().parse_args(argv)
-    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure}
+    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
     return handlers[args.command](args)
 
 

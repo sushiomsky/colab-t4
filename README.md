@@ -185,6 +185,46 @@ colab-t4 api chat --message 'Reply with exactly: COLAB_T4_OK'
 ```
 
 
+## Multiple Google accounts
+
+`up` provisions from a rotation of Google accounts. If the first account
+cannot create a T4 session (quota exhausted, entitlement rejected, Google
+temporarily unavailable), it automatically tries the next account, and so on,
+until one succeeds. A second T4 for a different session is allocated to the
+least-recently-used account, so concurrent runtimes spread across profiles
+instead of stacking on one account.
+
+Accounts are managed with the `accounts` command:
+
+```bash
+colab-t4 accounts list            # current rotation, health, and usage
+colab-t4 accounts add --id work   # interactive Colab OAuth flow for a new profile
+colab-t4 accounts add --id personal --email you@gmail.com
+colab-t4 accounts remove work     # unregister and delete the profile
+```
+
+Each added account gets its own isolated HOME directory
+(`~/.config/colab-t4/accounts/<id>`), so its Colab OAuth token, session
+registry, and history are completely independent of the other accounts.
+
+`accounts add` runs the installed Colab CLI's remote copy-paste OAuth flow:
+it prints an authorization URL, you open it in any browser, sign in as the
+Google account to add, approve, and paste the returned code back into the
+terminal. The CLI then verifies the token (`colab sessions`) and resolves the
+account email automatically.
+
+The implicit `default` account is the legacy single-account setup: it uses
+your real login HOME and cannot be removed. Failover ordering is:
+
+1. The account hosting the recorded session, when re-provisioning the same
+   session (affinity).
+2. Healthy accounts, least-recently-used first.
+3. Accounts with a recorded failure, least-recently-used first (they may have
+   recovered, so they are tried last instead of being skipped).
+
+Failures are recorded per account in `~/.config/colab-t4/accounts.json`
+(mode 0600) and shown by `colab-t4 accounts list`.
+
 ## Security and state
 
 - `TS_AUTHKEY`, `HF_TOKEN`, generated API keys, and SSH passwords are never

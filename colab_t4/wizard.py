@@ -52,8 +52,8 @@ def _default_pubkey() -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
-def _auth_ok(cli: ColabCLI) -> tuple[bool, str]:
-    if not authenticate_available():
+def _auth_ok(cli: ColabCLI, home: str | None = None) -> tuple[bool, str]:
+    if not authenticate_available(home):
         return False, "credentials are missing"
     result = cli.run(cli.sessions_command(), cli.auth_log_path(), timeout=60)
     text = (result.stdout or "") + (result.stderr or "")
@@ -69,7 +69,8 @@ def _auth_ok(cli: ColabCLI) -> tuple[bool, str]:
 
 def ensure_colab_auth(*, interactive: bool, input_fn: Input = input, cli: ColabCLI | None = None) -> None:
     cli = cli or ColabCLI.discover()
-    ok, reason = _auth_ok(cli)
+    home = getattr(cli, "home", None)
+    ok, reason = _auth_ok(cli, home)
     if ok:
         return
     if not interactive:
@@ -86,7 +87,7 @@ def ensure_colab_auth(*, interactive: bool, input_fn: Input = input, cli: ColabC
     if result != 0:
         raise RuntimeError("Colab authentication command failed; run `colab sessions` and retry")
     print("Waiting for authentication verification...")
-    ok, reason = _auth_ok(cli)
+    ok, reason = _auth_ok(cli, home)
     if not ok:
         raise RuntimeError("Colab authentication still failed: " + reason)
     print("Colab authentication verified.")

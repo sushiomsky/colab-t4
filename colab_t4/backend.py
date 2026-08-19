@@ -33,18 +33,29 @@ class ColabCLIError(RuntimeError):
 class ColabCLI:
     executable: str
     version: str
+    home: str | None = None
 
     @classmethod
-    def discover(cls) -> "ColabCLI":
+    def discover(cls, home: str | None = None) -> "ColabCLI":
         executable = os.environ.get("COLAB_CLI") or shutil.which("colab")
         if not executable:
             raise ColabCLIError("Colab CLI executable 'colab' was not found on PATH")
-        result = subprocess.run([executable, "version"], text=True, capture_output=True, timeout=30)
+        result = subprocess.run([executable, "version"], text=True, capture_output=True, timeout=30, env=cls._env(home))
         output = (result.stdout + result.stderr).strip()
         match = VERSION_RE.search(output)
         if result.returncode != 0 or not match:
             raise ColabCLIError(f"unable to identify Colab CLI version: {redact(output)}")
-        return cls(executable, match.group(1))
+        return cls(executable, match.group(1), home)
+
+    @staticmethod
+    def _env(home: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        if home:
+            env["HOME"] = home
+        return env
+
+    def cli_env(self) -> dict[str, str]:
+        return self._env(self.home)
 
     def command(self, *args: str) -> list[str]:
         return [self.executable, *args]
@@ -61,7 +72,7 @@ class ColabCLI:
     def run_interactive_auth(self) -> int:
         # `colab sessions` is the harmless CLI operation that triggers the
         # installed CLI's remote OAuth flow when credentials are absent.
-        result = subprocess.run(self.command("sessions"), check=False)
+        result = subprocess.run(self.command("sessions"), check=False, env=self.cli_env())
         return result.returncode
 
     def upload_command(self, session: str, local: Path, remote: str) -> list[str]:
@@ -96,7 +107,7 @@ class ColabCLI:
                 text=True,
                 capture_output=True,
                 timeout=timeout,
-                env=os.environ.copy(),
+                env=self.cli_env(),
             )
         except subprocess.TimeoutExpired as exc:
             output = redact((exc.stdout or "") + (exc.stderr or ""), secrets)
@@ -115,9 +126,15 @@ class ColabCLI:
         return result
 
 
-def auth_summary() -> dict[str, object]:
-    token = Path(os.path.expanduser("~/.config/colab-cli/token.json"))
-    adc = Path(os.path.expanduser("~/.config/gcloud/application_default_credentials.json"))
+def colab_cli_token_path(home: str | None = None) -> Path:
+    base = Path(home) if home else Path.home()
+    return base / ".config" / "colab-cli" / "token.json"
+
+
+def auth_summary(home: str | None = None) -> dict[str, object]:
+    base = Path(home) if home else Path.home()
+    token = base / ".config" / "colab-cli" / "token.json"
+    adc = base / ".config" / "gcloud" / "application_default_credentials.json"
     return {
         "oauth_token": token.exists() and token.stat().st_size > 0,
         "adc_credentials": adc.exists() and adc.stat().st_size > 0,
@@ -126,6 +143,6 @@ def auth_summary() -> dict[str, object]:
     }
 
 
-def authenticate_available() -> bool:
-    info = auth_summary()
+def authenticate_available(home: str | None = None) -> bool:
+    info = auth_summary(home)
     return bool(info["oauth_token"] or info["adc_credentials"])

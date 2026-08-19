@@ -50,8 +50,8 @@ def test_browserless_up_command_sequence(monkeypatch, tmp_path):
     monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
     fake = FakeCLI()
-    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(lambda cls: fake))
-    monkeypatch.setattr(lifecycle, "authenticate_available", lambda: True)
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(lambda cls, home=None: fake))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
     options = type("Options", (), {
         "session": "colab-t4", "model": lifecycle.DEFAULT_MODEL, "quant": "Q4_K_M",
         "port": 8080, "ctx": 8192, "api_key": "api-test", "password": "pw-test",
@@ -70,7 +70,7 @@ def test_down_targets_recorded_session(monkeypatch, tmp_path):
     monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
     lifecycle._update(session="exact-session", runtime_state="ready")
     fake = FakeCLI()
-    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(lambda cls: fake))
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(lambda cls, home=None: fake))
     lifecycle.down()
     assert fake.calls == [["colab", "stop", "--session", "exact-session"]]
     assert load_state() == {}

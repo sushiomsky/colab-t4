@@ -4,11 +4,13 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .accounts import candidate_accounts, get_account, record_failure, record_success
 from .backend import ColabCLI, ColabCLIError, authenticate_available
 from .config import (
     clear_runtime_api_key,
@@ -45,6 +47,17 @@ def _log(kind: str) -> Path:
 
 def _session_name(options: Any) -> str:
     return getattr(options, "session", None) or DEFAULT_HOSTNAME
+
+
+def _account_home(state: dict[str, Any]) -> str | None:
+    """HOME override for the account recorded in state, if any."""
+    account_id = state.get("account")
+    if not account_id:
+        return None
+    try:
+        return get_account(account_id).home
+    except KeyError:
+        return None
 
 
 def doctor() -> tuple[dict[str, Any], int]:
@@ -137,13 +150,34 @@ def _download_ready(cli: ColabCLI, session: str, secrets: list[str]) -> dict[str
 
 
 def up(options: Any) -> dict[str, Any]:
-    cli = ColabCLI.discover()
-    if not authenticate_available():
-        raise RuntimeError("Colab CLI authentication is unavailable; authenticate `colab` first")
     session = _session_name(options)
     current = load_state()
     if current.get("session") == session and current.get("runtime_state") in {"creating", "executing", "ready"}:
         return wait(options)
+    accounts = candidate_accounts(session, current)
+    if not accounts:
+        raise RuntimeError("no Colab accounts configured; run `colab-t4 accounts add`")
+    failures: list[str] = []
+    for index, account in enumerate(accounts):
+        try:
+            return _provision(options, session, account)
+        except (ColabCLIError, RuntimeError, TimeoutError) as exc:
+            if len(accounts) == 1:
+                raise
+            message = str(exc)
+            record_failure(account.id, message)
+            failures.append(f"{account.id}: {message}")
+            if index < len(accounts) - 1:
+                print(f"account '{account.id}' failed ({message}); trying next account", file=sys.stderr)
+    raise RuntimeError("all accounts failed: " + " | ".join(failures))
+
+
+def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
+    cli = ColabCLI.discover(home=account.home)
+    if not authenticate_available(account.home):
+        raise RuntimeError(
+            f"account '{account.id}' has no Colab CLI authentication; run `colab-t4 accounts add`"
+        )
     notebook_fd, notebook_name = tempfile.mkstemp(prefix="colab-t4-", suffix=".ipynb")
     os.close(notebook_fd)
     notebook = Path(notebook_name)
@@ -152,7 +186,7 @@ def up(options: Any) -> dict[str, Any]:
         _make_notebook(options, notebook)
         secret_file, remote_config = _write_secret_file(options, session)
         secret_values = [str(value) for value in remote_config.values() if isinstance(value, str)]
-        _update(session=session, runtime_state="creating", accelerator="T4", notebook="submitted", last_error=None, started_at=now())
+        _update(session=session, account=account.id, runtime_state="creating", accelerator="T4", notebook="submitted", last_error=None, started_at=now())
         created = cli.run(cli.new_command(session, "T4"), _log("colab"), timeout=300, secrets=secret_values)
         if created.returncode:
             _update(runtime_state="failed", last_error="Colab CLI failed to create the T4 session")
@@ -175,6 +209,7 @@ def up(options: Any) -> dict[str, Any]:
         if not ready or not ready.get("ready") or not ready.get("tests", {}).get("chat"):
             _update(runtime_state="failed", last_error="readiness artifact missing or smoke test failed")
             raise ColabCLIError("remote provisioning completed without a valid readiness artifact")
+        record_success(account.id)
         state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
         return state
     except KeyboardInterrupt:
@@ -193,8 +228,8 @@ def up(options: Any) -> dict[str, Any]:
 
 
 def wait(options: Any) -> dict[str, Any]:
-    cli = ColabCLI.discover()
     state = load_state()
+    cli = ColabCLI.discover(home=_account_home(state))
     session = getattr(options, "session", None) or state.get("session")
     if not session:
         raise RuntimeError("no recorded Colab session; run `colab-t4 up`")
@@ -223,7 +258,7 @@ def down() -> None:
     if not session:
         clear_runtime_api_key()
         return
-    cli = ColabCLI.discover()
+    cli = ColabCLI.discover(home=_account_home(state))
     result = cli.run(cli.stop_command(session), _log("colab"), timeout=120, secrets=_secret_values())
     # Colab stop is idempotent in the CLI; even an already-lost session must not
     # leave local runtime state behind.
