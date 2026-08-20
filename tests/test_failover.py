@@ -49,7 +49,10 @@ class FakeCLI:
                 "tailscale_ip": "100.64.0.2",
                 "api_base": "http://100.64.0.2:8080/v1",
                 "model": "/content/model/model.Q4_K_M.gguf",
-                "tests": {"chat": True, "models": True},
+                "tests": {
+                    "health": True, "chat": True, "models": True,
+                    "cuda_offload": True, "tailscale_ssh": True,
+                },
             }))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -184,3 +187,79 @@ def test_up_without_any_account_fails_clearly(tmp_path, monkeypatch):
     with pytest.raises(Exception) as excinfo:
         lifecycle.up(options())
     assert "no Colab CLI authentication" in str(excinfo.value)
+
+
+def test_up_account_option_prioritizes_requested_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    add_account("a", home=str(tmp_path / "home-a"))
+    add_account("b", home=str(tmp_path / "home-b"))
+    discovered = []
+
+    def fake_discover(cls, home=None):
+        discovered.append(home)
+        return FakeCLI(home=home)
+
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(fake_discover))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
+    result = lifecycle.up(options(account="b"))
+
+    assert result["account"] == "b"
+    assert discovered[0] == str(tmp_path / "home-b")
+
+
+def test_up_account_only_does_not_try_another_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    home_a = str(tmp_path / "home-a")
+    home_b = str(tmp_path / "home-b")
+    Path(home_a).mkdir()
+    Path(home_b).mkdir()
+    add_account("a", home=home_a)
+    add_account("b", home=home_b)
+    discovered = []
+
+    def fake_discover(cls, home=None):
+        discovered.append(home)
+        return FakeCLI(home=home, fail_new=True)
+
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(fake_discover))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
+    with pytest.raises(Exception):
+        lifecycle.up(options(account="a", account_only=True))
+
+    assert discovered == [home_a]
+
+
+def test_up_recovers_dead_recorded_runtime_through_account_rotation(tmp_path, monkeypatch):
+    """A stale recorded session must not bypass automatic profile failover."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    home_a = str(tmp_path / "home-a")
+    home_b = str(tmp_path / "home-b")
+    Path(home_a).mkdir()
+    Path(home_b).mkdir()
+    add_account("a", home=home_a)
+    add_account("b", home=home_b)
+    lifecycle._update(session="colab-t4", account="a", runtime_state="ready")
+
+    def dead_wait(_options):
+        raise RuntimeError("node vanished")
+
+    monkeypatch.setattr(lifecycle, "wait", dead_wait)
+    calls = []
+
+    def fake_provision(_options, session, account):
+        calls.append((session, account.id))
+        if account.id != "b":
+            raise RuntimeError(f"{account.id} unavailable")
+        return lifecycle._update(session=session, account=account.id, runtime_state="ready")
+
+    monkeypatch.setattr(lifecycle, "_provision", fake_provision)
+    result = lifecycle.up(options())
+
+    assert result["runtime_state"] == "ready"
+    assert calls == [("colab-t4", "a"), ("colab-t4", "default"), ("colab-t4", "b")]
+    accounts = {account.id: account for account in load_accounts()}
+    assert accounts["a"].last_error == "a unavailable"
+    assert accounts["b"].last_error == ""

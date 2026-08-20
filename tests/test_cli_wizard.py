@@ -5,6 +5,7 @@ import colab_t4.cli as cli
 
 
 def test_up_passes_collected_values_into_same_provision_call(monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", "/tmp/colab-t4-test-state")
     values = {
         "session": "wizard-session",
         "model": "repo/model",
@@ -20,6 +21,7 @@ def test_up_passes_collected_values_into_same_provision_call(monkeypatch):
         "persist_secrets": False,
     }
     monkeypatch.setattr(cli, "interactive_available", lambda force=False: True)
+    monkeypatch.setattr(cli.ColabCLI, "discover", classmethod(lambda cls: object()))
     monkeypatch.setattr(cli, "ensure_colab_auth", lambda **kwargs: None)
     monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: dict(values))
     monkeypatch.setattr(cli, "persist", lambda _: None)

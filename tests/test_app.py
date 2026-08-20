@@ -32,10 +32,21 @@ def test_notebook_is_valid_and_deterministic():
         assert "{{" not in source
         if cell["cell_type"] == "code":
             compile(source, "<cell>", "exec")
+    source = "".join(first["cells"][1]["source"])
+    assert "SECRET_FILE.unlink()" in source
+    assert "LLAMA_CPP_RUNTIME" in source
+    assert "llama-server" in source
 
 
 def test_redaction():
     assert redact("prefix secret-token suffix", ["secret-token"]) == "prefix [REDACTED] suffix"
+
+
+def test_tool_call_capability_classification():
+    from colab_t4 import cli
+    assert cli._classify_tool_response({"choices": [{"message": {"tool_calls": [{"id": "x"}]}}]}) == (True, "native")
+    assert cli._classify_tool_response({"choices": [{"message": {"content": "<tool_call><function=x></function></tool_call>"}}]}) == (True, "qwen_xml_compat")
+    assert cli._classify_tool_response({"choices": [{"message": {"content": "ordinary answer"}}]}) == (False, "none")
 
 
 def test_discover_colab_cli(monkeypatch):

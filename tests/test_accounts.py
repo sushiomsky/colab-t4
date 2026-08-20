@@ -1,5 +1,6 @@
 """Account registry and failover ordering tests."""
 import json
+import argparse
 
 import pytest
 
@@ -108,3 +109,23 @@ def test_accounts_file_is_mode_0600(state):
     assert (state / "accounts.json").stat().st_mode & 0o777 == 0o600
     raw = json.loads((state / "accounts.json").read_text())
     assert raw[0]["id"] == "default"
+
+
+def test_auth_cancel_removes_pending_temporary_profile(state, monkeypatch):
+    from colab_t4 import cli
+
+    home = state / "accounts" / "pending"
+    home.mkdir(parents=True)
+    fifo = home / "oauth.stdin"
+    fifo.write_text("")
+    (state / "pending-auth.json").write_text(json.dumps({
+        "account_id": "pending",
+        "home": str(home),
+        "fifo": str(fifo),
+        "pid": 999999,
+    }))
+    monkeypatch.setattr(cli.os, "kill", lambda *_args: (_ for _ in ()).throw(ProcessLookupError()))
+
+    assert cli._accounts_auth_cancel(argparse.Namespace(id=None)) == 0
+    assert not (state / "pending-auth.json").exists()
+    assert not home.exists()

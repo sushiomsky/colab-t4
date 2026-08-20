@@ -10,6 +10,7 @@ from .notebook import (
     DEFAULT_QUANT,
     build_notebook,
 )
+from .provider import ModelSpec, account_rows, available_models, resolve_model
 
 __all__ = [
     "__version__",
@@ -19,4 +20,8 @@ __all__ = [
     "DEFAULT_PORT",
     "DEFAULT_CTX",
     "DEFAULT_QUANT",
+    "ModelSpec",
+    "account_rows",
+    "available_models",
+    "resolve_model",
 ]

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 
-DEFAULT_MODEL = "mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated-GGUF"
-DEFAULT_QUANT = "Q4_K_M"
+DEFAULT_MODEL = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
+DEFAULT_QUANT = "Q6_K"
 DEFAULT_HOSTNAME = "colab-t4"
 DEFAULT_PORT = 8081
-DEFAULT_CTX = 8192
+DEFAULT_CTX = 16384
+DEFAULT_LLAMA_CPP_COMMIT = "b10345"
 
 PROVISIONING = r'''# colab-t4 provisioning
 import glob
@@ -58,6 +59,10 @@ def request_json(url, api_key=None, payload=None, timeout=20):
 if not SECRET_FILE.exists():
     raise RuntimeError("provisioning secret file is missing")
 secrets = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+try:
+    SECRET_FILE.unlink()
+except OSError:
+    pass
 required = ["tailscale_authkey", "api_key", "model_repo", "quant", "port", "ctx"]
 if any(not secrets.get(key) for key in required):
     raise RuntimeError("provisioning configuration is incomplete")
@@ -159,38 +164,70 @@ model_size = model_path.stat().st_size
 if model_size > 11 * 1024**3:
     raise RuntimeError("selected GGUF is too large for a 16 GiB T4")
 
-# Prefer the verified CUDA wheel index; source build is the bounded fallback.
-variants = ["cu126", "cu124", "cu121", "cu128", "cu130"]
-installed = False
-for variant in variants:
-    subprocess.run(["pip", "uninstall", "-y", "-q", "llama-cpp-python"], capture_output=True)
-    pip_result = subprocess.run([
-        "pip", "install", "-q", "--extra-index-url",
-        "https://abetlen.github.io/llama-cpp-python/whl/" + variant,
-        "--only-binary", ":all:", "llama-cpp-python[server]",
-    ], text=True, capture_output=True, timeout=1800)
-    record("llama-install.log", (pip_result.stdout or "") + (pip_result.stderr or ""))
-    imported = subprocess.run(["python3", "-c", "import llama_cpp"], capture_output=True)
-    if pip_result.returncode == 0 and imported.returncode == 0:
-        installed = True
-        break
-if not installed:
-    build = subprocess.run([
-        "pip", "install", "-q", "llama-cpp-python[server]",
-    ], env={**os.environ, "CMAKE_ARGS": "-DGGML_CUDA=on -DGGML_CUDA_F16=on"},
-        text=True, capture_output=True, timeout=2400)
-    record("llama-install.log", (build.stdout or "") + (build.stderr or ""))
-    if build.returncode:
-        raise RuntimeError("CUDA llama backend installation failed")
-
-import llama_cpp
-if not llama_cpp.llama_supports_gpu_offload():
-    raise RuntimeError("llama backend was not built with CUDA GPU offload")
-
 api_key = secrets["api_key"]
 port = int(secrets["port"])
 ctx = int(secrets["ctx"])
+runtime_mode = str(secrets.get("runtime", os.environ.get("LLAMA_CPP_RUNTIME", os.environ.get("COLAB_T4_RUNTIME", "auto")))).lower()
+llama_commit = str(secrets.get("llama_cpp_commit", os.environ.get("LLAMA_CPP_COMMIT", "b10345")))
+native_bin = Path("/content/llama-cache") / llama_commit / "source" / "build" / "bin" / "llama-server"
+native_ready = False
+native_error = ""
+if runtime_mode in {"auto", "native"}:
+    try:
+        run(["apt-get", "install", "-y", "-qq", "git", "cmake", "build-essential"], log_name="llama-native-build.log", timeout=900)
+        native_bin.parent.parent.mkdir(parents=True, exist_ok=True)
+        source_dir = Path("/content/llama-cache") / llama_commit / "source"
+        if not native_bin.exists():
+            if not (source_dir / ".git").exists():
+                if source_dir.exists():
+                    shutil.rmtree(source_dir)
+                run(["git", "clone", "--filter=blob:none", "--no-checkout", "https://github.com/ggml-org/llama.cpp.git", str(source_dir)], log_name="llama-native-build.log", timeout=900)
+            run(["git", "-C", str(source_dir), "fetch", "--depth", "1", "origin", llama_commit], log_name="llama-native-build.log", timeout=900)
+            run(["git", "-C", str(source_dir), "checkout", "--force", llama_commit], log_name="llama-native-build.log", timeout=120)
+            build_dir = source_dir / "build"
+            run(["cmake", "-S", str(source_dir), "-B", str(build_dir), "-DGGML_CUDA=ON", "-DCMAKE_BUILD_TYPE=Release", "-DGGML_NATIVE=OFF"], log_name="llama-native-build.log", timeout=1200)
+            run(["cmake", "--build", str(build_dir), "--config", "Release", "--target", "llama-server", "-j", "2"], log_name="llama-native-build.log", timeout=3600)
+        help_result = run([str(native_bin), "--help"], log_name="llama-native-help.log", timeout=60, check=False)
+        help_text = (help_result.stdout or "") + (help_result.stderr or "")
+        native_ready = help_result.returncode == 0 and "--jinja" in help_text
+        if not native_ready:
+            native_error = "native llama-server missing required --jinja support"
+    except Exception as exc:
+        native_error = str(exc)
+        native_ready = False
+    if not native_ready:
+        record("llama-native-fallback.log", native_error)
+if runtime_mode == "native" and not native_ready:
+    raise RuntimeError("native llama-server requested but build/validation failed: " + native_error)
+
+if not native_ready:
+    # Existing verified fallback: prefer CUDA wheels, then a CUDA source build.
+    variants = ["cu126", "cu124", "cu121", "cu128", "cu130"]
+    installed = False
+    for variant in variants:
+        subprocess.run(["pip", "uninstall", "-y", "-q", "llama-cpp-python"], capture_output=True)
+        pip_result = subprocess.run([
+            "pip", "install", "-q", "--extra-index-url",
+            "https://abetlen.github.io/llama-cpp-python/whl/" + variant,
+            "--only-binary", ":all:", "llama-cpp-python[server]",
+        ], text=True, capture_output=True, timeout=1800)
+        record("llama-install.log", (pip_result.stdout or "") + (pip_result.stderr or ""))
+        imported = subprocess.run(["python3", "-c", "import llama_cpp"], capture_output=True)
+        if pip_result.returncode == 0 and imported.returncode == 0:
+            installed = True
+            break
+    if not installed:
+        build = subprocess.run(["pip", "install", "-q", "llama-cpp-python[server]"], env={**os.environ, "CMAKE_ARGS": "-DGGML_CUDA=on -DGGML_CUDA_F16=on"}, text=True, capture_output=True, timeout=2400)
+        record("llama-install.log", (build.stdout or "") + (build.stderr or ""))
+        if build.returncode:
+            raise RuntimeError("CUDA llama backend installation failed")
+    import llama_cpp
+    if not llama_cpp.llama_supports_gpu_offload():
+        raise RuntimeError("llama backend was not built with CUDA GPU offload")
+llama_python_version = getattr(locals().get("llama_cpp"), "__version__", None)
+
 subprocess.run(["pkill", "-TERM", "-f", "llama_cpp.server"], capture_output=True)
+subprocess.run(["pkill", "-TERM", "-f", "llama-server"], capture_output=True)
 for _ in range(20):
     probe = socket.socket()
     try:
@@ -203,12 +240,18 @@ for _ in range(20):
 else:
     raise RuntimeError("configured API port is still in use")
 server_log = open(LOG_DIR / "llama-server.log", "w")
-server = subprocess.Popen([
-    "python3", "-m", "llama_cpp.server", "--model", str(model_path),
-    "--model_alias", "local", "--n_gpu_layers", "-1", "--n_ctx", str(ctx),
-    "--flash_attn", "true", "--host", "0.0.0.0", "--port", str(port),
-    "--api_key", api_key,
-], stdout=server_log, stderr=subprocess.STDOUT, env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"})
+if native_ready:
+    server_args = [str(native_bin), "-m", str(model_path), "-a", "local", "-ngl", "99", "-c", str(ctx), "--host", "0.0.0.0", "--port", str(port), "--api-key", api_key]
+    help_text = ((LOG_DIR / "llama-native-help.log").read_text(encoding="utf-8", errors="replace") if (LOG_DIR / "llama-native-help.log").exists() else "")
+    if "--jinja" in help_text:
+        server_args.append("--jinja")
+    if "--reasoning" in help_text:
+        server_args += ["--reasoning", "off"]
+    if "--chat-template-kwargs" in help_text:
+        server_args += ["--chat-template-kwargs", '{"enable_thinking": false}']
+else:
+    server_args = ["python3", "-m", "llama_cpp.server", "--model", str(model_path), "--model_alias", "local", "--n_gpu_layers", "-1", "--n_ctx", str(ctx), "--flash_attn", "true", "--host", "0.0.0.0", "--port", str(port), "--api_key", api_key, "--chat_template_kwargs", '{"enable_thinking": false}']
+server = subprocess.Popen(server_args, stdout=server_log, stderr=subprocess.STDOUT, env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"})
 health_url = "http://127.0.0.1:" + str(port) + "/v1/models"
 healthy = False
 for _ in range(240):
@@ -242,6 +285,30 @@ chat_response = request_json(
     "http://127.0.0.1:" + str(port) + "/v1/chat/completions", api_key=api_key,
     payload={"model": "local", "messages": [{"role": "user", "content": "Reply with OK"}], "max_tokens": 8},
 )
+# Native function-calling smoke test. This is reported rather than made a
+# hard provisioning gate so older llama.cpp/model templates remain usable.
+tool_calling = False
+tool_calling_mode = "none"
+tool_calling_tested = True
+try:
+    tool_response = request_json(
+        "http://127.0.0.1:" + str(port) + "/v1/chat/completions", api_key=api_key,
+        payload={
+            "model": "local",
+            "messages": [{"role": "user", "content": "Use the test tool and then answer."}],
+            "tools": [{"type": "function", "function": {"name": "get_test_value", "description": "Return a fixed health-check value.", "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": "required", "max_tokens": 32,
+        },
+    )
+    tool_message = (tool_response.get("choices") or [{}])[0].get("message") or {}
+    if isinstance(tool_message.get("tool_calls"), list) and tool_message["tool_calls"]:
+        tool_calling = True
+        tool_calling_mode = "native"
+    elif isinstance(tool_message.get("content"), str) and "<tool_call>" in tool_message["content"] and "</tool_call>" in tool_message["content"]:
+        tool_calling = True
+        tool_calling_mode = "qwen_xml_compat"
+except Exception as exc:
+    record("tool-calling.log", str(exc))
 ready = {
     "ready": True,
     "gpu": gpu_lines[0],
@@ -251,7 +318,11 @@ ready = {
     "quant": secrets["quant"],
     "ssh_mode": ssh_mode,
     "server_pid": server.pid,
-    "tests": {"health": True, "models": True, "chat": True, "cuda_offload": True, "tailscale_ssh": ssh_mode == "tailscale"},
+    "tests": {"health": True, "models": True, "chat": True, "tool_calling": tool_calling, "tool_calling_mode": tool_calling_mode, "tool_calling_tested": tool_calling_tested, "cuda_offload": True, "tailscale_ssh": ssh_mode == "tailscale"},
+    "runtime": "llama-server" if native_ready else "llama-cpp-python",
+    "llama_cpp_commit": llama_commit if native_ready else None,
+    "llama_cpp_python_version": llama_python_version,
+    "native_error": native_error if not native_ready else None,
 }
 READY_FILE.write_text(json.dumps(ready, indent=2) + "\n", encoding="utf-8")
 os.chmod(READY_FILE, 0o600)

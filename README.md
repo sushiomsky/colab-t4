@@ -73,10 +73,28 @@ wizard's save option is selected.
 The default model is:
 
 ```text
-mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated-GGUF
+HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
 ```
 
-with `Q4_K_M`. Override deterministically:
+with `Q6_K`. The default context is 16K, a practical starting point for a
+16 GiB Tesla T4. Set `COLAB_T4_CTX` or pass `--ctx` explicitly; 32K may work
+depending on the server build, while 64K is a best-effort setting because KV
+cache memory can require CPU offload or fail on a 16 GiB T4. The notebook
+reports `tool_calling` separately in its readiness tests after sending an
+OpenAI-compatible native function-call request.
+
+Provisioning attempts the pinned CUDA-enabled native `ggml-org/llama.cpp`
+`llama-server` first (`COLAB_T4_RUNTIME=auto`, tested commit `b10345`). The
+build is cached under `/content/llama-cache` and validated for `--jinja`. If
+build or validation fails, the existing CUDA-enabled `llama-cpp-python`
+server remains the automatic fallback. Use `COLAB_T4_RUNTIME=native` to make
+native failure explicit, or `COLAB_T4_RUNTIME=python` to skip the attempt.
+Override the tested commit with `LLAMA_CPP_COMMIT=<commit>`.
+
+`colab-t4 status --json` reports the selected runtime, commit, native fallback
+reason, and tested `tool_calling_mode`.
+
+Override deterministically:
 
 ```bash
 colab-t4 up \
@@ -100,6 +118,11 @@ colab-t4 restart  stop the recorded session and create a new one
 colab-t4 down     stop exactly the recorded session; idempotent local cleanup
 colab-t4 doctor   validate Colab CLI, auth, SSH, and Tailscale configuration
 ```
+
+For integrations that manage account selection themselves, `up` and `restart`
+accept `--account NAME --account-only`. The command then provisions only that
+registered Google profile; a caller can implement deterministic recovery by
+trying the next profile after a failed readiness check.
 
 SSH uses Tailscale SSH by default:
 
@@ -224,6 +247,25 @@ your real login HOME and cannot be removed. Failover ordering is:
 
 Failures are recorded per account in `~/.config/colab-t4/accounts.json`
 (mode 0600) and shown by `colab-t4 accounts list`.
+
+## AblitBot provider integration
+
+The companion `/root/ablitbot/ablitbot.py` uses this CLI as its OpenAI-compatible
+provider. It provisions reviewed abliterated model aliases, controls runtime
+start/stop, and uses the account registry for profile selection and recovery.
+
+```text
+ablitbot profile list
+ablitbot profile add --id work
+ablitbot profile remove work
+ablitbot up
+ablitbot down
+```
+
+In Telegram, administrators can use `/up`, `/down`, `/model list`,
+`/model <alias>`, `/profile`, and `/profile <account>`. If the selected
+runtime becomes unhealthy, AblitBot tries the selected account first and then
+other registered accounts, keeping the model choice unchanged.
 
 ## Security and state
 

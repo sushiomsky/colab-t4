@@ -29,6 +29,21 @@ REMOTE_NOTEBOOK = "/content/colab-t4.ipynb"
 REMOTE_READY = "/content/.colab-t4-ready.json"
 
 
+def _ready_is_valid(ready: dict[str, Any]) -> bool:
+    """Require the remote artifact to prove every provider invariant."""
+    if not ready.get("ready"):
+        return False
+    tests = ready.get("tests")
+    if not isinstance(tests, dict):
+        return False
+    required = ("health", "models", "chat", "cuda_offload")
+    if not all(tests.get(name) is True for name in required):
+        return False
+    if ready.get("ssh_mode", "tailscale") == "tailscale" and tests.get("tailscale_ssh") is not True:
+        return False
+    return True
+
+
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -103,6 +118,8 @@ def _write_secret_file(options: Any, session: str) -> tuple[Path, dict[str, str]
         "port": str(configured.get("port", getattr(options, "port", DEFAULT_PORT))),
         "ctx": str(configured.get("ctx", getattr(options, "ctx", DEFAULT_CTX))),
         "hostname": configured.get("session", session),
+        "runtime": configured.get("runtime") or os.environ.get("COLAB_T4_RUNTIME", "auto"),
+        "llama_cpp_commit": configured.get("llama_cpp_commit") or os.environ.get("LLAMA_CPP_COMMIT", "b10345"),
     }
     if not config["tailscale_authkey"]:
         raise RuntimeError("TS_AUTHKEY is required for browserless provisioning")
@@ -153,8 +170,30 @@ def up(options: Any) -> dict[str, Any]:
     session = _session_name(options)
     current = load_state()
     if current.get("session") == session and current.get("runtime_state") in {"creating", "executing", "ready"}:
-        return wait(options)
+        # A recorded session is normally still progressing, but the remote
+        # runtime may have disappeared (Colab eviction, expired auth, or a
+        # lost Tailscale node).  Do not strand callers in `wait`: mark the
+        # stale attempt failed and continue through the normal account
+        # rotation below.  This is deliberately the same failover path used
+        # for a fresh `up`, so model/session configuration is preserved.
+        try:
+            return wait(options)
+        except (ColabCLIError, RuntimeError, TimeoutError) as exc:
+            active = current.get("account")
+            if active:
+                record_failure(str(active), str(exc))
+            _update(runtime_state="failed", last_error=f"recorded runtime unavailable: {exc}")
     accounts = candidate_accounts(session, current)
+    requested_account = getattr(options, "account", None)
+    if requested_account:
+        try:
+            selected = get_account(requested_account)
+        except KeyError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if getattr(options, "account_only", False):
+            accounts = [selected]
+        else:
+            accounts = [selected] + [account for account in accounts if account.id != selected.id]
     if not accounts:
         raise RuntimeError("no Colab accounts configured; run `colab-t4 accounts add`")
     failures: list[str] = []
@@ -201,16 +240,17 @@ def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
             _update(runtime_state="failed", last_error="notebook upload failed")
             raise ColabCLIError("failed to upload notebook")
         _update(runtime_state="executing")
-        executed = cli.run(cli.exec_command(session, notebook, float(getattr(options, "exec_timeout", 7200))), _log("notebook"), timeout=float(getattr(options, "exec_timeout", 7200)) + 120, secrets=secret_values)
+        exec_timeout = getattr(options, "exec_timeout", None) or 7200
+        executed = cli.run(cli.exec_command(session, notebook, float(exec_timeout)), _log("notebook"), timeout=float(exec_timeout) + 120, secrets=secret_values)
         if executed.returncode:
             _update(runtime_state="failed", last_error="remote notebook execution failed")
             raise ColabCLIError("remote provisioning failed; inspect `colab-t4 logs notebook`")
         ready = _download_ready(cli, session, secret_values)
-        if not ready or not ready.get("ready") or not ready.get("tests", {}).get("chat"):
+        if not ready or not _ready_is_valid(ready):
             _update(runtime_state="failed", last_error="readiness artifact missing or smoke test failed")
             raise ColabCLIError("remote provisioning completed without a valid readiness artifact")
         record_success(account.id)
-        state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
+        state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), runtime=ready.get("runtime", "llama-cpp-python"), llama_cpp_commit=ready.get("llama_cpp_commit"), llama_cpp_python_version=ready.get("llama_cpp_python_version"), native_error=ready.get("native_error"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
         return state
     except KeyboardInterrupt:
         _update(runtime_state="interrupted", last_error="interrupted by user")
@@ -243,8 +283,8 @@ def wait(options: Any) -> dict[str, Any]:
             save_state(state)
             raise RuntimeError("Colab session is not reachable; inspect `colab-t4 logs status`")
         ready = _download_ready(cli, session, _secret_values())
-        if ready and ready.get("ready"):
-            state.update({"runtime_state": "ready", "gpu": ready.get("gpu"), "tailscale_ip": ready.get("tailscale_ip"), "api_base": ready.get("api_base"), "model": ready.get("model"), "tests": ready.get("tests"), "last_error": None, "ready_at": state.get("ready_at") or now()})
+        if ready and _ready_is_valid(ready):
+            state.update({"runtime_state": "ready", "gpu": ready.get("gpu"), "tailscale_ip": ready.get("tailscale_ip"), "api_base": ready.get("api_base"), "model": ready.get("model"), "runtime": ready.get("runtime", state.get("runtime", "llama-cpp-python")), "llama_cpp_commit": ready.get("llama_cpp_commit", state.get("llama_cpp_commit")), "llama_cpp_python_version": ready.get("llama_cpp_python_version", state.get("llama_cpp_python_version")), "native_error": ready.get("native_error", state.get("native_error")), "tests": ready.get("tests"), "last_error": None, "ready_at": state.get("ready_at") or now()})
             save_state(state)
             return state
         state["runtime_state"] = "waiting"

@@ -4,9 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
+import shlex
 import subprocess
 import sys
+import time
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -14,7 +18,7 @@ from pathlib import Path
 from . import __version__
 from .accounts import account_home_dir, add_account, get_account, load_accounts, next_account_id, remove_account, resolve_account_email
 from .backend import ColabCLI, ColabCLIError
-from .config import load_secrets, load_state, logs_dir, redact, save_runtime_api_key
+from .config import _atomic_json, load_secrets, load_state, logs_dir, redact, save_runtime_api_key, state_dir
 from .notebook import DEFAULT_CTX, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
 from .lifecycle import doctor as lifecycle_doctor
 from .lifecycle import down as lifecycle_down
@@ -56,6 +60,18 @@ def _health() -> tuple[bool, str]:
         return False, redact(str(exc))
 
 
+def _classify_tool_response(response: dict) -> tuple[bool, str]:
+    """Classify a real tool probe without treating arbitrary prose as a call."""
+    choices = response.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    if isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+        return True, "native"
+    content = message.get("content")
+    if isinstance(content, str) and "<tool_call>" in content and "</tool_call>" in content:
+        return True, "qwen_xml_compat"
+    return False, "none"
+
+
 def _api_tests() -> dict[str, object]:
     result: dict[str, object] = {}
     try:
@@ -74,6 +90,23 @@ def _api_tests() -> dict[str, object]:
     except Exception as exc:
         result["chat"] = False
         result["chat_error"] = redact(str(exc))
+    try:
+        tool = _api_request("chat/completions", method="POST", payload={
+            "model": "local",
+            "messages": [{"role": "user", "content": "Use the health-check function."}],
+            "tools": [{"type": "function", "function": {"name": "get_test_value", "description": "Return a health-check value.", "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": "required",
+            "max_tokens": 16,
+        })
+        supported, mode = _classify_tool_response(tool)
+        result["tool_calling"] = supported
+        result["tool_calling_mode"] = mode
+        result["tool_calling_tested"] = True
+    except Exception as exc:
+        result["tool_calling"] = False
+        result["tool_calling_mode"] = "none"
+        result["tool_calling_tested"] = True
+        result["tool_calling_error"] = redact(str(exc))
     return result
 
 
@@ -84,6 +117,10 @@ def _status() -> tuple[dict, int]:
         "session": state.get("session"),
         "account": state.get("account"),
         "gpu": state.get("gpu"),
+        "runtime": state.get("runtime", "unknown"),
+        "llama_cpp_commit": state.get("llama_cpp_commit"),
+        "llama_cpp_python_version": state.get("llama_cpp_python_version"),
+        "native_error": state.get("native_error"),
         "accelerator": state.get("accelerator"),
         "notebook_execution": state.get("runtime_state"),
         "tailscale": {"ip": state.get("tailscale_ip"), "node": state.get("session")},
@@ -112,6 +149,8 @@ def print_status(result: dict, as_json: bool) -> None:
     print(f"session : {result.get('session') or '-'}")
     print(f"account : {result.get('account') or '-'}")
     print(f"gpu     : {result.get('gpu') or result.get('accelerator') or '-'}")
+    print(f"runtime : {result.get('runtime') or '-'}")
+    print(f"commit  : {result.get('llama_cpp_commit') or '-'}")
     ts = result.get("tailscale") or {}
     print(f"tailscale: {ts.get('ip') or '-'}")
     api = result.get("api") or {}
@@ -373,6 +412,189 @@ def _accounts_add(args: argparse.Namespace) -> int:
     return 0
 
 
+AUTH_URL_RE = re.compile(r"https://accounts\.google\.com/o/oauth2/auth\?\S+")
+
+
+def _pending_auth_path() -> Path:
+    return state_dir() / "pending-auth.json"
+
+
+def _read_pending_auth() -> dict:
+    try:
+        value = json.loads(_pending_auth_path().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _clear_pending_auth(pending: dict) -> None:
+    path = _pending_auth_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    fifo_text = str(pending.get("fifo", ""))
+    if fifo_text:
+        fifo = Path(fifo_text)
+        try:
+            fifo.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _accounts_auth_start(args: argparse.Namespace) -> int:
+    pending = _read_pending_auth()
+    if pending.get("pid"):
+        try:
+            os.kill(int(pending["pid"]), 0)
+            fail("another Google authentication flow is already waiting")
+        except ProcessLookupError:
+            _clear_pending_auth(pending)
+        except PermissionError:
+            fail("another Google authentication flow is already waiting")
+    account_id = args.id or next_account_id()
+    if account_id == "default":
+        fail("'default' is the implicit legacy account; choose a different id")
+    home_dir = account_home_dir(account_id)
+    try:
+        home_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        fail(f"an account directory for '{account_id}' already exists; pick a different --id")
+    fifo = home_dir / "oauth.stdin"
+    log_path = home_dir / "oauth.log"
+    try:
+        os.mkfifo(fifo, 0o600)
+        cli = ColabCLI.discover(home=str(home_dir))
+        fifo_fd = os.open(fifo, os.O_RDWR)
+        # The installed Colab CLI deliberately requires a TTY for OAuth.  A
+        # plain FIFO is not enough: it prints the URL and then aborts.  Use
+        # util-linux `script` as a tiny PTY adapter when available, while
+        # retaining the direct subprocess fallback for minimal hosts.
+        script = shutil.which("script")
+        if script:
+            command = shlex.join(cli.sessions_command())
+            process = subprocess.Popen(
+                [script, "-qefc", command, str(log_path)],
+                stdin=fifo_fd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                env=cli.cli_env(),
+                text=True,
+                start_new_session=True,
+            )
+            log_handle = None
+        else:
+            log_handle = log_path.open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                cli.sessions_command(),
+                stdin=fifo_fd,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=cli.cli_env(),
+                text=True,
+            )
+        os.close(fifo_fd)
+        if log_handle is not None:
+            log_handle.close()
+        url = ""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                text = ""
+            match = AUTH_URL_RE.search(text)
+            if match:
+                url = match.group(0)
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.2)
+        if not url:
+            process.terminate()
+            _clear_pending_auth({"fifo": str(fifo)})
+            shutil.rmtree(home_dir, ignore_errors=True)
+            fail("Colab CLI did not produce an authorization URL")
+        pending = {
+            "account_id": account_id,
+            "home": str(home_dir),
+            "fifo": str(fifo),
+            "log": str(log_path),
+            "pid": process.pid,
+            "created_at": time.time(),
+        }
+        _atomic_json(_pending_auth_path(), pending)
+        print(json.dumps({"account_id": account_id, "authorization_url": url}))
+        return 0
+    except Exception:
+        try:
+            os.close(fifo_fd)
+        except (NameError, OSError):
+            pass
+        try:
+            if log_handle is not None:
+                log_handle.close()
+        except (NameError, OSError):
+            pass
+        if home_dir.exists():
+            shutil.rmtree(home_dir, ignore_errors=True)
+        raise
+
+
+def _accounts_auth_finish(args: argparse.Namespace) -> int:
+    pending = _read_pending_auth()
+    if not pending or (args.id and pending.get("account_id") != args.id):
+        fail("no matching pending Google authentication flow")
+    code = (args.code or sys.stdin.read()).strip()
+    if not code:
+        fail("authorization code is required on stdin")
+    fifo = Path(str(pending.get("fifo", "")))
+    try:
+        with fifo.open("w", encoding="utf-8") as handle:
+            handle.write(code + "\n")
+    except OSError as exc:
+        fail("could not submit authorization result: " + str(exc))
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        try:
+            os.kill(int(pending["pid"]), 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.5)
+    home = str(pending["home"])
+    cli = ColabCLI.discover(home=home)
+    ok, reason = _auth_ok(cli, home)
+    if not ok:
+        _clear_pending_auth(pending)
+        shutil.rmtree(home, ignore_errors=True)
+        fail("authentication verification failed: " + reason)
+    email = resolve_account_email(home) or ""
+    add_account(str(pending["account_id"]), home=home, email=email)
+    _clear_pending_auth(pending)
+    print(json.dumps({"account_id": pending["account_id"], "email": email, "status": "added"}))
+    return 0
+
+
+def _accounts_auth_cancel(args: argparse.Namespace) -> int:
+    pending = _read_pending_auth()
+    if not pending or (args.id and pending.get("account_id") != args.id):
+        fail("no matching pending Google authentication flow")
+    pid = pending.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (ProcessLookupError, ValueError, TypeError):
+            pass
+        except PermissionError as exc:
+            fail("could not cancel the pending Google authentication flow: " + str(exc))
+    home = str(pending.get("home", ""))
+    _clear_pending_auth(pending)
+    if home:
+        shutil.rmtree(home, ignore_errors=True)
+    print(json.dumps({"account_id": pending.get("account_id"), "status": "cancelled"}))
+    return 0
+
+
 def _accounts_remove(args: argparse.Namespace) -> int:
     try:
         account = get_account(args.account)
@@ -404,6 +626,12 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         return _accounts_list(args)
     if args.accounts_command == "add":
         return _accounts_add(args)
+    if args.accounts_command == "auth-start":
+        return _accounts_auth_start(args)
+    if args.accounts_command == "auth-finish":
+        return _accounts_auth_finish(args)
+    if args.accounts_command == "auth-cancel":
+        return _accounts_auth_cancel(args)
     if args.accounts_command == "remove":
         return _accounts_remove(args)
     return 1
@@ -422,6 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     up = sub.add_parser("up", help="create, provision, and verify a T4 runtime")
     up.add_argument("--session", default=None)
+    up.add_argument("--account", default=None, help="try this registered Google account first")
+    up.add_argument("--account-only", action="store_true", help="do not fail over beyond --account")
     up.add_argument("--model", default=None)
     up.add_argument("--quant", default=None)
     up.add_argument("--port", type=int, default=None)
@@ -443,6 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("down", help="stop the recorded runtime")
     restart = sub.add_parser("restart", help="stop and recreate the runtime")
     restart.add_argument("--session", default=None)
+    restart.add_argument("--account", default=None, help="try this registered Google account first")
+    restart.add_argument("--account-only", action="store_true", help="do not fail over beyond --account")
     restart.add_argument("--model", default=None)
     restart.add_argument("--quant", default=None)
     restart.add_argument("--port", type=int, default=None)
@@ -474,6 +706,13 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_add = accounts_sub.add_parser("add", help="add an account via the interactive Colab OAuth flow")
     accounts_add.add_argument("--id")
     accounts_add.add_argument("--email")
+    accounts_auth_start = accounts_sub.add_parser("auth-start", help="start a browserless OAuth flow and return its URL")
+    accounts_auth_start.add_argument("--id")
+    accounts_auth_finish = accounts_sub.add_parser("auth-finish", help="finish a pending OAuth flow; read code from stdin")
+    accounts_auth_finish.add_argument("--id")
+    accounts_auth_finish.add_argument("--code", help="one-time authorization code (stdin is safer and preferred)")
+    accounts_auth_cancel = accounts_sub.add_parser("auth-cancel", help="cancel a pending OAuth flow and remove its temporary home")
+    accounts_auth_cancel.add_argument("--id")
     accounts_remove = accounts_sub.add_parser("remove", help="remove an account profile")
     accounts_remove.add_argument("account")
     accounts_remove.add_argument("--yes", action="store_true")

@@ -40,7 +40,10 @@ class FakeCLI:
                 "tailscale_ip": "100.64.0.2",
                 "api_base": "http://100.64.0.2:8080/v1",
                 "model": "/content/model/model.Q4_K_M.gguf",
-                "tests": {"chat": True, "models": True},
+                "tests": {
+                    "health": True, "chat": True, "models": True,
+                    "cuda_offload": True, "tailscale_ssh": True,
+                },
             }))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -64,6 +67,23 @@ def test_browserless_up_command_sequence(monkeypatch, tmp_path):
     assert result["tailscale_ip"] == "100.64.0.2"
     log_text = "".join(path.read_text() for path in (tmp_path / "state" / "logs").glob("*.log"))
     assert "api-test" not in log_text
+
+
+def test_ready_artifact_requires_all_provider_checks():
+    ready = {
+        "ready": True,
+        "ssh_mode": "tailscale",
+        "tests": {
+            "health": True,
+            "models": True,
+            "chat": True,
+            "cuda_offload": True,
+            "tailscale_ssh": True,
+        },
+    }
+    assert lifecycle._ready_is_valid(ready)
+    ready["tests"]["cuda_offload"] = False
+    assert not lifecycle._ready_is_valid(ready)
 
 
 def test_down_targets_recorded_session(monkeypatch, tmp_path):
