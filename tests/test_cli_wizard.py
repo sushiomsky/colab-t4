@@ -4,7 +4,7 @@ import json
 import colab_t4.cli as cli
 
 
-def test_up_passes_collected_values_into_same_provision_call(monkeypatch):
+def test_up_passes_collected_values_into_same_provision_call(monkeypatch, tmp_path):
     values = {
         "session": "wizard-session",
         "model": "repo/model",
@@ -19,10 +19,14 @@ def test_up_passes_collected_values_into_same_provision_call(monkeypatch):
         "ssh_pubkey": "",
         "persist_secrets": False,
     }
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "interactive_available", lambda force=False: True)
     monkeypatch.setattr(cli, "ensure_colab_auth", lambda **kwargs: None)
     monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: dict(values))
     monkeypatch.setattr(cli, "persist", lambda _: None)
+    # The real CLI discovery requires a `colab` binary; the provision call is
+    # mocked below, so a stub is enough here.
+    monkeypatch.setattr(cli.ColabCLI, "discover", classmethod(lambda cls, home=None: type("StubCLI", (), {"executable": "colab", "version": "0.6.0"})()))
     captured = {}
     monkeypatch.setattr(cli, "lifecycle_up", lambda options: captured.update(vars(options)))
     args = argparse.Namespace(

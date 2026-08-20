@@ -81,6 +81,16 @@ def test_candidate_affinity_prefers_account_hosting_session(state):
     assert [a.id for a in ordered] == ["b", "default", "a"]
 
 
+def test_candidate_affinity_skips_failed_hosting_account(state):
+    add_account("a", home=str(state / "ha"))
+    add_account("b", home=str(state / "hb"))
+    record_failure("a", "session died")
+    state_data = {"session": "dead-t4", "account": "a"}
+    ordered = candidate_accounts("dead-t4", state_data)
+    assert ordered[0].id != "a"
+    assert [a.id for a in ordered] == ["default", "b", "a"]
+
+
 def test_candidate_round_robin_for_new_session(state):
     add_account("a", home=str(state / "ha"))
     add_account("b", home=str(state / "hb"))

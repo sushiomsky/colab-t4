@@ -15,9 +15,10 @@ class FakeCLI:
     executable = "colab"
     version = "0.6.0"
 
-    def __init__(self, home=None, fail_new=False):
+    def __init__(self, home=None, fail_new=False, dead_status=False):
         self.home = home
         self.fail_new = fail_new
+        self.dead_status = dead_status
         self.calls = []
 
     def new_command(self, session, gpu):
@@ -40,6 +41,8 @@ class FakeCLI:
 
     def run(self, args, log_path, **kwargs):
         self.calls.append(list(args))
+        if args[1] == "status" and self.dead_status:
+            return subprocess.CompletedProcess(args, 1, "", "error: session not found")
         if args[1] == "new" and self.fail_new:
             return subprocess.CompletedProcess(args, 1, "", "error: Service Unavailable")
         if args[1] == "download" and args[-2] == "/content/.colab-t4-ready.json":
@@ -107,6 +110,34 @@ def test_up_single_account_keeps_original_error(tmp_path, monkeypatch):
     with pytest.raises(Exception) as excinfo:
         lifecycle.up(options())
     assert "Colab CLI could not create the T4 session" in str(excinfo.value)
+
+
+def test_up_fails_over_when_existing_session_is_lost(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    home_a = str(tmp_path / "home-a")
+    home_b = str(tmp_path / "home-b")
+    Path(home_a).mkdir()
+    Path(home_b).mkdir()
+    add_account("a", home=home_a)
+    add_account("b", home=home_b)
+    # Recorded session was ready but its Colab runtime died; account a hosted it.
+    lifecycle._update(session="colab-t4", runtime_state="ready", account="a")
+
+    def fake_discover(cls, home=None):
+        return FakeCLI(home=home, fail_new=home in (None, home_a), dead_status=home in (None, home_a))
+
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(fake_discover))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
+
+    result = lifecycle.up(options())
+    assert result["runtime_state"] == "ready"
+    assert result["account"] == "b"
+    accounts = {a.id: a for a in load_accounts()}
+    assert accounts["a"].last_error and "did not become ready" in accounts["a"].last_error
+    assert accounts["b"].last_ok and not accounts["b"].last_error
+    err = capsys.readouterr().err
+    assert "trying next account" in err
 
 
 def test_down_uses_recorded_account_home(tmp_path, monkeypatch):

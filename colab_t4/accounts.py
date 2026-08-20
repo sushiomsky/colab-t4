@@ -145,7 +145,10 @@ def candidate_accounts(session: str, state: dict[str, Any]) -> list[Account]:
       concurrent sessions round-robin across accounts (a second T4 lands on
       the next account instead of stacking on one).
     - When the requested session is already recorded, the account hosting it
-      is tried first (affinity), then the rotation continues.
+      is tried first (affinity) as long as it is healthy, then the rotation
+      continues. A hosting account with a recorded failure never jumps the
+      queue, so re-provisioning a dead session moves straight to the next
+      account.
     """
     accounts = load_accounts()
 
@@ -156,7 +159,7 @@ def candidate_accounts(session: str, state: dict[str, Any]) -> list[Account]:
     active = state.get("account")
     if active and state.get("session") == session:
         first = next((account for account in accounts if account.id == active), None)
-        if first is not None:
+        if first is not None and not first.last_error:
             ordered = [first] + [account for account in ordered if account.id != active]
     return ordered
 

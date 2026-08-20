@@ -29,6 +29,10 @@ REMOTE_NOTEBOOK = "/content/colab-t4.ipynb"
 REMOTE_READY = "/content/.colab-t4-ready.json"
 
 
+class SessionUnreachable(RuntimeError):
+    """The recorded Colab session cannot be reached (stopped or lost)."""
+
+
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -153,8 +157,21 @@ def up(options: Any) -> dict[str, Any]:
     session = _session_name(options)
     current = load_state()
     if current.get("session") == session and current.get("runtime_state") in {"creating", "executing", "ready"}:
-        return wait(options)
-    accounts = candidate_accounts(session, current)
+        try:
+            return wait(options)
+        except (SessionUnreachable, TimeoutError) as exc:
+            accounts = candidate_accounts(session, load_state())
+            if len(accounts) <= 1:
+                raise
+            active = current.get("account")
+            if active:
+                record_failure(active, f"existing session did not become ready: {exc}")
+            print(f"existing session did not become ready ({exc}); trying next account", file=sys.stderr)
+            try:
+                down()
+            except (RuntimeError, ColabCLIError):
+                pass
+    accounts = candidate_accounts(session, load_state())
     if not accounts:
         raise RuntimeError("no Colab accounts configured; run `colab-t4 accounts add`")
     failures: list[str] = []
@@ -241,7 +258,7 @@ def wait(options: Any) -> dict[str, Any]:
         if status.returncode:
             state["runtime_state"] = "stopped"
             save_state(state)
-            raise RuntimeError("Colab session is not reachable; inspect `colab-t4 logs status`")
+            raise SessionUnreachable("Colab session is not reachable; inspect `colab-t4 logs status`")
         ready = _download_ready(cli, session, _secret_values())
         if ready and ready.get("ready"):
             state.update({"runtime_state": "ready", "gpu": ready.get("gpu"), "tailscale_ip": ready.get("tailscale_ip"), "api_base": ready.get("api_base"), "model": ready.get("model"), "tests": ready.get("tests"), "last_error": None, "ready_at": state.get("ready_at") or now()})

@@ -192,7 +192,10 @@ cannot create a T4 session (quota exhausted, entitlement rejected, Google
 temporarily unavailable), it automatically tries the next account, and so on,
 until one succeeds. A second T4 for a different session is allocated to the
 least-recently-used account, so concurrent runtimes spread across profiles
-instead of stacking on one account.
+instead of stacking on one account. The same rotation applies when the
+recorded session is lost or never becomes ready again: `up` records the
+failure, stops the dead session, and continues with the next account instead
+of erroring out.
 
 Accounts are managed with the `accounts` command:
 
@@ -217,7 +220,7 @@ The implicit `default` account is the legacy single-account setup: it uses
 your real login HOME and cannot be removed. Failover ordering is:
 
 1. The account hosting the recorded session, when re-provisioning the same
-   session (affinity).
+   session and it has no recorded failure (affinity).
 2. Healthy accounts, least-recently-used first.
 3. Accounts with a recorded failure, least-recently-used first (they may have
    recovered, so they are tried last instead of being skipped).
