@@ -215,3 +215,52 @@ def test_up_without_any_account_fails_clearly(tmp_path, monkeypatch):
     with pytest.raises(Exception) as excinfo:
         lifecycle.up(options())
     assert "no Colab CLI authentication" in str(excinfo.value)
+
+
+def test_concurrent_named_runtime_starts_claim_different_accounts(tmp_path, monkeypatch):
+    import threading
+
+    from colab_t4.runtimes import create_runtime, runtime_context
+
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    home_a = str(tmp_path / "home-a")
+    Path(home_a).mkdir()
+    add_account("a", home=home_a)
+    create_runtime("coder", model_repo=lifecycle.DEFAULT_MODEL, quant="Q4_K_M")
+    create_runtime("research", model_repo=lifecycle.DEFAULT_MODEL, quant="Q4_K_M")
+
+    barrier = threading.Barrier(2)
+    discovered = []
+    discovered_lock = threading.Lock()
+
+    def fake_discover(cls, home=None):
+        with discovered_lock:
+            discovered.append(home)
+        barrier.wait(timeout=3)
+        return FakeCLI(home=home)
+
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(fake_discover))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
+
+    results = {}
+    errors = []
+
+    def start(runtime_id):
+        try:
+            with runtime_context(runtime_id):
+                results[runtime_id] = lifecycle.up(options(session=f"colab-t4-{runtime_id}"))
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=start, args=("coder",))
+    second = threading.Thread(target=start, args=("research",))
+    first.start()
+    second.start()
+    first.join(5)
+    second.join(5)
+
+    assert not errors
+    assert not first.is_alive() and not second.is_alive()
+    assert {results["coder"]["account"], results["research"]["account"]} == {"default", "a"}
+    assert set(discovered) == {None, home_a}
