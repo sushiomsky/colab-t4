@@ -16,6 +16,7 @@ from .accounts import account_home_dir, add_account, get_account, load_accounts,
 from .backend import ColabCLI, ColabCLIError
 from .config import load_secrets, load_state, logs_dir, redact, save_runtime_api_key
 from .notebook import DEFAULT_CTX, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
+from .model import current_model, switch_model
 from .lifecycle import doctor as lifecycle_doctor
 from .lifecycle import down as lifecycle_down
 from .lifecycle import restart as lifecycle_restart
@@ -181,8 +182,6 @@ def cmd_configure(args: argparse.Namespace) -> int:
     return 0
 
 
-
-
 def cmd_up(args: argparse.Namespace) -> int:
     interactive = interactive_available(getattr(args, "interactive", False)) and not getattr(args, "non_interactive", False)
     try:
@@ -233,6 +232,23 @@ def cmd_api(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_model(args: argparse.Namespace) -> int:
+    try:
+        if args.model_command == "current":
+            result = current_model()
+        else:
+            result = switch_model(args.repository, args.quant, args.timeout)
+    except (RuntimeError, ColabCLIError, ValueError) as exc:
+        fail(redact(str(exc)))
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"runtime : {result.get('runtime_state') or '-'}")
+        print(f"model   : {result.get('model_repo') or result.get('model') or '-'}")
+        print(f"quant   : {result.get('quant') or '-'}")
+    return 0
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     try:
         lifecycle_wait(args)
@@ -245,6 +261,8 @@ def cmd_wait(args: argparse.Namespace) -> int:
     if args.wait_health and not result.get("api", {}).get("reachable"):
         return 2
     return code
+
+
 def cmd_ssh(raw: list[str]) -> int:
     if raw in (["-h"], ["--help"]):
         print("usage: colab-t4 ssh [SESSION] [SSH_OPTIONS_AND_REMOTE_COMMAND...]")
@@ -266,12 +284,12 @@ def cmd_ssh(raw: list[str]) -> int:
     return 0
 
 
-
-
 def cmd_status(args: argparse.Namespace) -> int:
     result, code = _status()
     print_status(result, args.json)
     return code
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     paths = sorted(logs_dir().glob("*.log")) if args.kind == "all" else [logs_dir() / f"{args.kind}.log"]
     secrets = list(load_secrets().values())
@@ -416,6 +434,19 @@ def _api_action_parser(sub):
     return api
 
 
+def _model_action_parser(sub):
+    model = sub.add_parser("model", help="inspect or switch the model in the running runtime")
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    current = model_sub.add_parser("current", help="show the currently recorded model")
+    current.add_argument("--json", action="store_true")
+    switch = model_sub.add_parser("switch", help="switch GGUF model without recreating the Colab session")
+    switch.add_argument("repository")
+    switch.add_argument("--quant", default=DEFAULT_QUANT)
+    switch.add_argument("--timeout", type=float, default=3600)
+    switch.add_argument("--json", action="store_true")
+    return model
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="colab-t4", description="Browserless T4 Colab runtime lifecycle manager")
     parser.add_argument("--version", action="version", version=f"colab-t4 {__version__}")
@@ -456,8 +487,9 @@ def build_parser() -> argparse.ArgumentParser:
     restart.add_argument("--non-interactive", action="store_true")
     restart.add_argument("--yes", action="store_true")
     _api_action_parser(sub)
+    _model_action_parser(sub)
     logs = sub.add_parser("logs", help="show redacted lifecycle logs")
-    logs.add_argument("kind", nargs="?", default="all", choices=["all", "colab", "notebook", "status", "runtime", "local"])
+    logs.add_argument("kind", nargs="?", default="all", choices=["all", "colab", "notebook", "status", "runtime", "local", "model-switch"])
     configure = sub.add_parser("configure", help="interactively collect and save configuration")
     configure.add_argument("--show", action="store_true")
     configure.add_argument("--reset", action="store_true")
@@ -485,7 +517,19 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "ssh":
         return cmd_ssh(argv[1:])
     args = build_parser().parse_args(argv)
-    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
+    handlers = {
+        "up": cmd_up,
+        "status": cmd_status,
+        "wait": cmd_wait,
+        "down": cmd_down,
+        "restart": cmd_restart,
+        "api": cmd_api,
+        "model": cmd_model,
+        "logs": cmd_logs,
+        "doctor": cmd_doctor,
+        "configure": cmd_configure,
+        "accounts": cmd_accounts,
+    }
     return handlers[args.command](args)
 
 
