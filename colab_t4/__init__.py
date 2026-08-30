@@ -1,6 +1,6 @@
 """colab-t4: GPU Colab runtime on your Tailnet with an OpenAI-compatible API."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 from .notebook import (
     DEFAULT_CTX,

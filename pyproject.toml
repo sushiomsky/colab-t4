@@ -4,17 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "colab-t4"
-version = "0.3.1"
-description = "Browserless Google Colab T4 lifecycle manager with Tailscale SSH and OpenAI-compatible inference"
+version = "0.4.0"
+description = "Browserless Google Colab T4 lifecycle manager with Tailscale SSH, OpenAI-compatible inference, and MCP control"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
+mcp = ["mcp>=2,<3; python_version >= '3.10'"]
 test = ["pytest>=8"]
 
 [project.scripts]
 colab-t4 = "colab_t4.cli:main"
+colab-t4-mcp = "colab_t4.mcp_server:main"
 
 [tool.setuptools]
 packages = ["colab_t4"]

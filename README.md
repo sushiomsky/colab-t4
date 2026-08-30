@@ -1,10 +1,11 @@
 # colab-t4
 
 Browserless lifecycle manager for a Google Colab NVIDIA T4 runtime. It uses the
-installed Google Colab CLI, uploads a generated provisioning notebook and
-secret configuration, executes it remotely, and verifies Tailscale,
+installed Google Colab CLI, uploads generated provisioning code and secret
+configuration separately, executes it remotely, and verifies Tailscale,
 passwordless Tailscale SSH, CUDA offload, and an authenticated OpenAI-compatible
-API.
+API. Version 0.4.0 also adds in-place GGUF model switching and a local stdio MCP
+server for Hermes Agent and other MCP hosts.
 
 ## Verified Colab CLI
 
@@ -51,6 +52,7 @@ colab-t4 wait --wait-health
 colab-t4 ssh -- nvidia-smi
 colab-t4 ssh -- curl -fsS http://127.0.0.1:8081/v1/models
 colab-t4 api
+colab-t4 model current --json
 colab-t4 logs all
 colab-t4 down
 ```
@@ -65,10 +67,11 @@ colab-t4 down
 5. Downloads the machine-readable readiness artifact.
 6. Records the session, GPU, Tailscale IP, API endpoint, and smoke-test results
    in `~/.config/colab-t4/state.json`.
+
 The generated API key is kept in `~/.config/colab-t4/runtime-api-key.json`
-with mode `0600` so later `status`, `wait`, and `api` commands can authenticate.
-`down` removes it; Tailscale and SSH credentials are not persisted unless the
-wizard's save option is selected.
+with mode `0600` so later `status`, `wait`, `api`, model-switch, and MCP commands
+can authenticate. `down` removes it; Tailscale and SSH credentials are not
+persisted unless the wizard's save option is selected.
 
 The default model is:
 
@@ -76,7 +79,7 @@ The default model is:
 mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated-GGUF
 ```
 
-with `Q4_K_M`. Override deterministically:
+with `Q4_K_M`. Override deterministically when creating the runtime:
 
 ```bash
 colab-t4 up \
@@ -90,16 +93,101 @@ or fallback quant is selected.
 ## Commands
 
 ```text
-colab-t4 up       create, provision, and verify a T4 runtime
-colab-t4 status   show lifecycle, GPU, Tailscale, SSH/API/model state
-colab-t4 wait     bounded readiness wait; --wait-health checks API health
-colab-t4 ssh      forward SSH options and remote commands unchanged
-colab-t4 logs     show redacted local Colab/notebook/runtime logs
-colab-t4 api      print API base URL and shell-safe usage
-colab-t4 restart  stop the recorded session and create a new one
-colab-t4 down     stop exactly the recorded session; idempotent local cleanup
-colab-t4 doctor   validate Colab CLI, auth, SSH, and Tailscale configuration
+colab-t4 up        create, provision, and verify a T4 runtime
+colab-t4 status    show lifecycle, GPU, Tailscale, SSH/API/model state
+colab-t4 wait      bounded readiness wait; --wait-health checks API health
+colab-t4 ssh       forward SSH options and remote commands unchanged
+colab-t4 logs      show redacted local Colab/notebook/runtime logs
+colab-t4 api       print or exercise the authenticated OpenAI-compatible API
+colab-t4 model     inspect or switch the running GGUF model in place
+colab-t4 accounts  manage isolated Google-account failover profiles
+colab-t4 restart   stop the recorded session and create a new one
+colab-t4 down      stop exactly the recorded session; idempotent local cleanup
+colab-t4 doctor    validate Colab CLI, auth, SSH, and Tailscale configuration
+colab-t4-mcp       expose lifecycle/model tools over MCP stdio (Python 3.10+)
 ```
+
+## In-place model switching
+
+A ready T4 can change GGUF models without releasing/recreating the Colab
+session, rejoining Tailscale, or rotating to another Google account:
+
+```bash
+colab-t4 model current --json
+
+colab-t4 model switch \
+  QuantFactory/Mistral-Nemo-Instruct-2407-abliterated-GGUF \
+  --quant Q4_K_M \
+  --timeout 3600 \
+  --json
+```
+
+The switcher downloads and validates the new GGUF **before** stopping the
+healthy server. It then restarts `llama_cpp.server` with full GPU offload and
+requires all of these checks before updating readiness state:
+
+- authenticated `/v1/models`
+- authenticated `/v1/chat/completions`
+- CUDA/GPU-offload evidence in the server log
+
+If the new server fails after the old server was stopped, the switcher attempts
+to restart the previous model. A successful rollback keeps the runtime marked
+ready and the command still returns failure so callers know the requested model
+was not activated. If rollback also fails, the runtime is marked failed so
+`colab-t4 restart` or the normal `up` recovery path can take over.
+
+## Hermes Agent / MCP
+
+The base package remains compatible with Python 3.9. The current official MCP
+Python SDK v2 requires Python 3.10+, so install the MCP extra in a Python 3.10+
+environment:
+
+```bash
+cd /root/colab-t4
+python3.11 -m venv .venv-mcp
+. .venv-mcp/bin/activate
+pip install -e '.[mcp]'
+
+colab-t4-mcp
+```
+
+`colab-t4-mcp` is a local **stdio** server. It exposes only explicit non-secret
+operations:
+
+```text
+backend_status
+backend_start
+backend_stop
+backend_restart
+model_current
+model_switch
+api_info
+accounts_list
+```
+
+For Hermes Agent, add it under `mcp_servers` in `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  colab_t4:
+    command: "/root/colab-t4/.venv-mcp/bin/colab-t4-mcp"
+    connect_timeout: 60
+    timeout: 7200
+    supports_parallel_tool_calls: false
+```
+
+Then test/reload it with Hermes:
+
+```bash
+hermes mcp test colab_t4
+# Restart Hermes, or use /reload-mcp in an active Hermes session.
+```
+
+The large tool timeout is intentional: provisioning and model downloads can
+take much longer than Hermes' ordinary tool-call default. The MCP server never
+returns API keys, Hugging Face tokens, Tailscale auth keys, SSH passwords,
+Colab OAuth token paths, or per-account HOME paths. `api_info` returns only the
+OpenAI-compatible base URL and the model alias `local`.
 
 SSH uses Tailscale SSH by default:
 
@@ -128,6 +216,7 @@ colab-t4 ssh -- uname -a
 `status --json` is intended for automation. Exit code 0 means ready and the
 API model-list check passed; 1 means unknown/not ready; 2 means a recorded
 provisioning failure.
+
 ## Interactive first-run setup
 
 `colab-t4 up` automatically enters the wizard when it is running with a TTY.
@@ -184,7 +273,6 @@ colab-t4 api models
 colab-t4 api chat --message 'Reply with exactly: COLAB_T4_OK'
 ```
 
-
 ## Multiple Google accounts
 
 `up` provisions from a rotation of Google accounts. If the first account
@@ -231,10 +319,14 @@ Failures are recorded per account in `~/.config/colab-t4/accounts.json`
 ## Security and state
 
 - `TS_AUTHKEY`, `HF_TOKEN`, generated API keys, and SSH passwords are never
-  embedded in the notebook source or committed to the repository.
-- Provisioning secrets are uploaded separately to `/content/.colab-t4-secrets.json`
-  and are not printed. Local secrets are stored mode 0600 under
-  `~/.config/colab-t4/secrets.json`.
+  embedded in provisioning/model-switch notebook source or committed to the
+  repository.
+- Provisioning secrets are uploaded separately to `/content/.colab-t4-secrets.json`;
+  model-switch secrets are uploaded separately to
+  `/content/.colab-t4-model-switch.json`.
+- Local secret/config files are mode 0600 under `~/.config/colab-t4/`.
+- MCP responses use explicit allow-listed schemas and do not expose credential
+  files or account HOME paths.
 - Logs are mode 0600 and redact known secret values.
 - Use a short-lived or single-use Tailscale auth key and restrict the node with
   Tailscale ACLs.
@@ -245,13 +337,25 @@ Failures are recorded per account in `~/.config/colab-t4/accounts.json`
 
 ## Testing and release
 
+Base compatibility:
+
 ```bash
 cd /root/colab-t4
 python3 -m venv /tmp/colab-t4-test-venv
 /tmp/colab-t4-test-venv/bin/pip install '.[test]'
 /tmp/colab-t4-test-venv/bin/colab-t4 --version
-/tmp/colab-t4-test-venv/bin/colab-t4 --help
-/tmp/colab-t4-test-venv/bin/pytest
+/tmp/colab-t4-test-venv/bin/colab-t4 model --help
+/tmp/colab-t4-test-venv/bin/pytest -q
+```
+
+MCP integration (Python 3.10+):
+
+```bash
+python3.11 -m venv /tmp/colab-t4-mcp-test-venv
+/tmp/colab-t4-mcp-test-venv/bin/pip install '.[test,mcp]'
+/tmp/colab-t4-mcp-test-venv/bin/python -c \
+  'from colab_t4.mcp_server import build_server; print(type(build_server()).__name__)'
+/tmp/colab-t4-mcp-test-venv/bin/pytest -q
 ```
 
 The release archive is `/root/colab-t4-final.zip`. It excludes virtualenvs,
@@ -260,6 +364,7 @@ models, credentials, runtime state, logs, caches, and build output.
 ## External limits
 
 Colab availability, account entitlement, OAuth validity, T4 quota, Hugging Face
-availability, and Tailscale network access are external dependencies. If
-Colab authentication or quota blocks `up`, the command exits nonzero and keeps
-redacted diagnostics in `~/.config/colab-t4/logs/`.
+availability, Tailscale network access, and remote model repository contents are
+external dependencies. If Colab authentication or quota blocks `up`, the
+command exits nonzero and keeps redacted diagnostics in
+`~/.config/colab-t4/logs/`.
