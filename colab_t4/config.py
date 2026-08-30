@@ -134,10 +134,11 @@ def load_runtime_api_key() -> str:
 
 def load_secrets() -> dict[str, str]:
     saved = load_saved_secrets()
-    if selected_runtime() != "default":
+    runtime_id = selected_runtime()
+    if runtime_id != "default":
         saved = {key: value for key, value in saved.items() if key not in _RUNTIME_DEFAULT_KEYS}
     runtime_key = load_runtime_api_key()
-    if runtime_key:
+    if runtime_key and (runtime_id != "default" or "api_key" not in saved):
         saved["api_key"] = runtime_key
     return saved
 
