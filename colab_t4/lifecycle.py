@@ -10,7 +10,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .accounts import candidate_accounts, get_account, record_failure, record_success
+from .accounts import (
+    account_operation,
+    candidate_accounts,
+    claim_candidate_account,
+    get_account,
+    record_failure,
+    record_success,
+)
 from .backend import ColabCLI, ColabCLIError, authenticate_available
 from .config import (
     clear_runtime_api_key,
@@ -171,20 +178,27 @@ def up(options: Any) -> dict[str, Any]:
                 down()
             except (RuntimeError, ColabCLIError):
                 pass
-    accounts = candidate_accounts(session, load_state())
-    if not accounts:
+
+    available = candidate_accounts(session, load_state())
+    if not available:
         raise RuntimeError("no Colab accounts configured; run `colab-t4 accounts add`")
+
+    account_count = len(available)
     failures: list[str] = []
-    for index, account in enumerate(accounts):
+    excluded: set[str] = set()
+    for index in range(account_count):
+        account = claim_candidate_account(session, load_state(), excluded)
+        excluded.add(account.id)
         try:
-            return _provision(options, session, account)
+            with account_operation(account.id):
+                return _provision(options, session, account)
         except (ColabCLIError, RuntimeError, TimeoutError) as exc:
-            if len(accounts) == 1:
+            if account_count == 1:
                 raise
             message = str(exc)
             record_failure(account.id, message)
             failures.append(f"{account.id}: {message}")
-            if index < len(accounts) - 1:
+            if index < account_count - 1:
                 print(f"account '{account.id}' failed ({message}); trying next account", file=sys.stderr)
     raise RuntimeError("all accounts failed: " + " | ".join(failures))
 
@@ -268,6 +282,7 @@ def wait(options: Any) -> dict[str, Any]:
         save_state(state)
         time.sleep(5)
     raise TimeoutError(f"timed out waiting for Colab session '{session}'")
+
 
 def down() -> None:
     state = load_state()
