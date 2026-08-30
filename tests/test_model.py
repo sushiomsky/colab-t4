@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from colab_t4 import model
+from colab_t4 import config, model
 from colab_t4.accounts import Account, save_accounts
 from colab_t4.config import load_state, save_secrets, save_state
+from colab_t4.runtimes import create_runtime, runtime_context
 
 
 class FakeCLI:
@@ -146,6 +147,48 @@ def test_failed_switch_and_failed_rollback_marks_runtime_failed(monkeypatch, tmp
     state = load_state()
     assert state["runtime_state"] == "failed"
     assert "switch and rollback failed" in state["last_error"]
+
+
+def test_named_model_switch_does_not_mutate_neighbor_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    config.save_secrets({"hf_token": "hf-secret-test", "ctx": "8192", "port": "8081"})
+    create_runtime("coder", model_repo="example/old-GGUF", quant="Q4_K_M")
+    create_runtime("research", model_repo="example/research-GGUF", quant="Q5_K_M")
+
+    with runtime_context("coder"):
+        config.save_state({
+            "session": "coder-session", "account": "default", "runtime_state": "ready",
+            "model": "/content/model/coder-old.gguf", "model_repo": "example/old-GGUF",
+            "quant": "Q4_K_M", "api_base": "http://100.64.0.1:8081/v1",
+            "tests": {"models": True, "chat": True, "cuda_offload": True},
+        })
+    with runtime_context("research"):
+        config.save_state({
+            "session": "research-session", "account": "default", "runtime_state": "ready",
+            "model": "/content/model/research.gguf", "model_repo": "example/research-GGUF",
+            "quant": "Q5_K_M", "api_base": "http://100.64.0.2:8081/v1",
+            "tests": {"models": True, "chat": True, "cuda_offload": True},
+        })
+        research_state = config.state_path().read_bytes()
+        research_metadata = (config.state_dir() / "runtime.json").read_bytes()
+        research_key = config.runtime_api_key_path().read_bytes()
+
+    fake = FakeCLI(ready={
+        "ready": True,
+        "model": "/content/models/new/model.Q4_K_M.gguf",
+        "model_repo": "example/new-model-GGUF",
+        "quant": "Q4_K_M",
+        "tests": {"models": True, "chat": True, "cuda_offload": True},
+    })
+    monkeypatch.setattr(model.ColabCLI, "discover", classmethod(lambda cls, home=None: fake))
+    with runtime_context("coder"):
+        result = model.switch_model("example/new-model-GGUF", "Q4_K_M", timeout=30)
+        assert result["model_repo"] == "example/new-model-GGUF"
+
+    with runtime_context("research"):
+        assert config.state_path().read_bytes() == research_state
+        assert (config.state_dir() / "runtime.json").read_bytes() == research_metadata
+        assert config.runtime_api_key_path().read_bytes() == research_key
 
 
 def test_generated_switch_script_has_required_guards_and_no_literal_secrets():
