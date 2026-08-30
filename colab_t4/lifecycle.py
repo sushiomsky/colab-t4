@@ -241,7 +241,20 @@ def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
             _update(runtime_state="failed", last_error="readiness artifact missing or smoke test failed")
             raise ColabCLIError("remote provisioning completed without a valid readiness artifact")
         record_success(account.id)
-        state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
+        state = _update(
+            runtime_state="ready",
+            accelerator="T4",
+            gpu=ready.get("gpu"),
+            tailscale_ip=ready.get("tailscale_ip"),
+            api_base=ready.get("api_base"),
+            model=ready.get("model"),
+            model_repo=remote_config["model_repo"],
+            quant=remote_config["quant"],
+            ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")),
+            tests=ready.get("tests"),
+            last_error=None,
+            ready_at=now(),
+        )
         return state
     except KeyboardInterrupt:
         _update(runtime_state="interrupted", last_error="interrupted by user")
