@@ -68,11 +68,11 @@
 - Produces MCP tools: `backend_status`, `backend_start`, `backend_stop`, `backend_restart`, `model_current`, `model_switch`, `api_info`, `accounts_list`
 - Produces: `build_server()` and `main() -> int`
 
-- [ ] **Step 1: Write failing tests** for safe payload helpers, lifecycle/model delegation, and no-secret/no-HOME output.
-- [ ] **Step 2: Verify RED** because the MCP adapter is missing.
-- [ ] **Step 3: Implement** current MCP v2 `MCPServer` stdio integration with guarded imports and an optional v1 `FastMCP` fallback.
-- [ ] **Step 4: Run base tests without MCP plus MCP integration tests on Python 3.10+ with the extra installed.
-- [ ] **Step 5: Commit** `feat: add Hermes MCP server`.
+- [x] **Step 1: Write failing tests** for safe payload helpers, lifecycle/model delegation, and no-secret/no-HOME output.
+- [x] **Step 2: Verify RED** because the MCP adapter is missing.
+- [x] **Step 3: Implement** current MCP v2 `MCPServer` stdio integration with guarded imports and an optional v1 `FastMCP` fallback.
+- [x] **Step 4: Run base tests without MCP plus MCP integration tests on Python 3.10+ with the extra installed.**
+- [x] **Step 5: Commit** `feat: add Hermes MCP server`.
 
 ### Task 4: Packaging, documentation and release metadata
 
@@ -88,15 +88,15 @@
 - Produces optional dependency `mcp = ["mcp>=2,<3; python_version >= '3.10'"]`
 - Produces script `colab-t4-mcp = "colab_t4.mcp_server:main"`
 
-- [ ] **Step 1: Add packaging/entrypoint assertions** before metadata changes.
-- [ ] **Step 2: Verify those assertions fail.**
-- [ ] **Step 3: Update** version, conditional MCP dependency, script entrypoint, README Hermes configuration/model-switch examples, and split base/MCP CI jobs.
-- [ ] **Step 4: Verify** base tests on Python 3.9/3.11/3.13 and MCP integration on Python 3.11.
-- [ ] **Step 5: Commit** `release: prepare colab-t4 0.4.0`.
+- [x] **Step 1: Add packaging/entrypoint assertions** before metadata changes.
+- [x] **Step 2: Verify those assertions fail.**
+- [x] **Step 3: Update** version, conditional MCP dependency, script entrypoint, README Hermes configuration/model-switch examples, and split base/MCP CI jobs.
+- [x] **Step 4: Verify** base tests on Python 3.9/3.11/3.13 and MCP integration on Python 3.11.
+- [x] **Step 5: Commit** `release: prepare colab-t4 0.4.0`.
 
 ### Task 5: Final verification
 
-- [ ] Compare branch against `main` and inspect every changed file for scope/security regressions.
-- [ ] Verify no literal credentials or tokens appear in the diff.
-- [ ] Verify GitHub Actions is green across the supported matrix.
+- [x] Compare branch against `main` and inspect every changed file for scope/security regressions.
+- [x] Verify no literal credentials or tokens appear in the diff; only deliberately fake test fixtures are present.
+- [x] Verify GitHub Actions is green across Python 3.9/3.11/3.13 plus the real MCP-v2 integration job.
 - [ ] Update the draft PR with architecture, rollback guarantees, MCP tools, Hermes configuration and verification evidence; mark ready for review.
