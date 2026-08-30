@@ -73,6 +73,19 @@ def test_precedence_environment_over_saved(monkeypatch, tmp_path):
     assert values["ssh_password"] == "env-pw"
 
 
+def test_default_saved_api_key_still_beats_runtime_key_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "cfg"))
+    config.save_secrets({
+        "tailscale_authkey": "saved-ts",
+        "api_key": "saved-api",
+        "ssh_mode": "password",
+        "ssh_password": "saved-pw",
+    })
+    config.save_runtime_api_key("runtime-fallback-key")
+    values = collect(Options(), allow_prompt=False)
+    assert values["api_key"] == "saved-api"
+
+
 def test_persisted_config_is_0600_and_show_is_redacted(monkeypatch, tmp_path):
     monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "cfg"))
     persist({"persist_secrets": True, "tailscale_authkey": "ts-secret", "api_key": "api-secret", "ssh_password": "pw-secret"})
