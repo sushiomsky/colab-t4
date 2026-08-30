@@ -22,7 +22,11 @@ from .lifecycle import down as lifecycle_down
 from .lifecycle import restart as lifecycle_restart
 from .lifecycle import up as lifecycle_up
 from .lifecycle import wait as lifecycle_wait
+from .runtimes import create_runtime, runtime_context, runtime_inventory
 from .wizard import _auth_ok, collect, configure_status, ensure_colab_auth, interactive_available, persist, reset
+
+_RUNTIME_SCOPED_COMMANDS = {"up", "status", "wait", "ssh", "logs", "api", "model", "restart", "down"}
+_GLOBAL_COMMANDS = {"runtimes", "accounts", "configure", "doctor"}
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -427,6 +431,41 @@ def cmd_accounts(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_runtimes(args: argparse.Namespace) -> int:
+    if args.runtimes_command == "list":
+        rows = runtime_inventory()
+        if args.json:
+            print(json.dumps(rows, indent=2, sort_keys=True))
+            return 0
+        for row in rows:
+            model = row.get("model_repo") or row.get("model") or "-"
+            print(
+                f"{str(row.get('id') or '-'):<16} "
+                f"{str(row.get('runtime_state') or 'unknown'):<12} "
+                f"session={row.get('session') or '-'} account={row.get('account') or '-'} "
+                f"model={model} quant={row.get('quant') or '-'} "
+                f"api={row.get('api_base') or '-'} api-key={'yes' if row.get('api_key_configured') else 'no'}"
+            )
+        return 0
+
+    if args.runtimes_command == "create":
+        try:
+            created = create_runtime(args.name, model_repo=args.model, quant=args.quant)
+        except (RuntimeError, ValueError) as exc:
+            fail(redact(str(exc)))
+        result = {**created, "api_key_configured": True}
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"runtime : {result['id']}")
+            print(f"session : {result['session']}")
+            print(f"model   : {result['model_repo']}")
+            print(f"quant   : {result['quant']}")
+            print("api-key : configured")
+        return 0
+    return 1
+
+
 def _api_action_parser(sub):
     api = sub.add_parser("api", help="exercise or print the authenticated API")
     api.add_argument("action", nargs="?", choices=["models", "chat"], default=None)
@@ -450,6 +489,7 @@ def _model_action_parser(sub):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="colab-t4", description="Browserless T4 Colab runtime lifecycle manager")
     parser.add_argument("--version", action="version", version=f"colab-t4 {__version__}")
+    parser.add_argument("--runtime", default=None, help="select a named runtime namespace")
     sub = parser.add_subparsers(dest="command", required=True)
     up = sub.add_parser("up", help="create, provision, and verify a T4 runtime")
     up.add_argument("--session", default=None)
@@ -509,14 +549,54 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_remove = accounts_sub.add_parser("remove", help="remove an account profile")
     accounts_remove.add_argument("account")
     accounts_remove.add_argument("--yes", action="store_true")
+    runtimes = sub.add_parser("runtimes", help="manage named runtime namespaces")
+    runtimes_sub = runtimes.add_subparsers(dest="runtimes_command", required=True)
+    runtimes_list = runtimes_sub.add_parser("list", help="list default and named runtimes")
+    runtimes_list.add_argument("--json", action="store_true")
+    runtimes_create = runtimes_sub.add_parser("create", help="create a named runtime namespace")
+    runtimes_create.add_argument("name")
+    runtimes_create.add_argument("--model", default=DEFAULT_MODEL)
+    runtimes_create.add_argument("--quant", default=DEFAULT_QUANT)
+    runtimes_create.add_argument("--json", action="store_true")
     return parser
+
+
+def _extract_leading_runtime(argv: list[str]) -> tuple[str | None, list[str]]:
+    tokens = list(argv)
+    if not tokens:
+        return None, tokens
+    if tokens[0] == "--runtime":
+        if len(tokens) < 2:
+            fail("--runtime requires a value", 2)
+        return tokens[1], tokens[2:]
+    if tokens[0].startswith("--runtime="):
+        runtime_id = tokens[0].split("=", 1)[1]
+        if not runtime_id:
+            fail("--runtime requires a value", 2)
+        return runtime_id, tokens[1:]
+    return None, tokens
+
+
+def _selected_runtime_id(explicit: str | None) -> str:
+    return explicit or os.environ.get("COLAB_T4_RUNTIME") or "default"
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == "ssh":
-        return cmd_ssh(argv[1:])
+    explicit_runtime, raw_tokens = _extract_leading_runtime(argv)
+
+    # SSH intentionally bypasses argparse so all SSH options and the remote
+    # command remain byte-for-byte positional tokens after the `ssh` command.
+    if raw_tokens and raw_tokens[0] == "ssh":
+        runtime_id = _selected_runtime_id(explicit_runtime)
+        try:
+            with runtime_context(runtime_id):
+                return cmd_ssh(raw_tokens[1:])
+        except (RuntimeError, ValueError) as exc:
+            fail(redact(str(exc)))
+
     args = build_parser().parse_args(argv)
+    runtime_id = _selected_runtime_id(args.runtime)
     handlers = {
         "up": cmd_up,
         "status": cmd_status,
@@ -529,8 +609,21 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": cmd_doctor,
         "configure": cmd_configure,
         "accounts": cmd_accounts,
+        "runtimes": cmd_runtimes,
     }
-    return handlers[args.command](args)
+
+    if args.command in _GLOBAL_COMMANDS:
+        if runtime_id != "default":
+            fail(f"'{args.command}' is a global command; named runtime selector '{runtime_id}' is not allowed")
+        return handlers[args.command](args)
+
+    if args.command not in _RUNTIME_SCOPED_COMMANDS:
+        return handlers[args.command](args)
+    try:
+        with runtime_context(runtime_id):
+            return handlers[args.command](args)
+    except (RuntimeError, ValueError) as exc:
+        fail(redact(str(exc)))
 
 
 if __name__ == "__main__":
