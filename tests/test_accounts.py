@@ -118,3 +118,54 @@ def test_accounts_file_is_mode_0600(state):
     assert (state / "accounts.json").stat().st_mode & 0o777 == 0o600
     raw = json.loads((state / "accounts.json").read_text())
     assert raw[0]["id"] == "default"
+
+
+def test_accounts_remain_global_inside_named_runtime(state):
+    from colab_t4.runtimes import create_runtime, runtime_context
+
+    create_runtime("coder", model_repo="example/model", quant="Q4_K_M")
+    with runtime_context("coder"):
+        add_account("work", home=str(state / "accounts" / "work"))
+        assert accounts.accounts_path() == state / "accounts.json"
+        assert accounts.account_home_dir("work") == state / "accounts" / "work"
+    assert get_account("work").id == "work"
+
+
+def test_claim_reserves_lru_before_next_runtime_claim(state):
+    add_account("a", home=str(state / "ha"))
+    first = accounts.claim_candidate_account("coder-session", {}, set())
+    second = accounts.claim_candidate_account("research-session", {}, {first.id})
+    assert second.id != first.id
+    assert get_account(first.id).last_used_at
+
+
+def test_account_operation_serializes_threads(state):
+    import threading
+    import time
+
+    entered = []
+    first_inside = threading.Event()
+    release_first = threading.Event()
+
+    def first():
+        with accounts.account_operation("default"):
+            entered.append("first")
+            first_inside.set()
+            assert release_first.wait(2)
+
+    def second():
+        assert first_inside.wait(2)
+        with accounts.account_operation("default"):
+            entered.append("second")
+
+    t1 = threading.Thread(target=first)
+    t2 = threading.Thread(target=second)
+    t1.start()
+    t2.start()
+    assert first_inside.wait(2)
+    time.sleep(0.05)
+    assert entered == ["first"]
+    release_first.set()
+    t1.join(2)
+    t2.join(2)
+    assert entered == ["first", "second"]
