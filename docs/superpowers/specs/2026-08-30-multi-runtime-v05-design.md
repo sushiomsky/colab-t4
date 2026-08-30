@@ -53,9 +53,10 @@ Named runtimes live below the existing base state directory:
 ~/.config/colab-t4/
 ├── state.json                     # legacy/default runtime
 ├── runtime-api-key.json           # legacy/default runtime API key
-├── secrets.json                   # global saved configuration/secrets
+├── secrets.json                   # global saved secrets + legacy/default defaults
 ├── accounts.json                  # global account registry
 ├── accounts/                      # global isolated Colab OAuth homes
+├── accounts.lock                  # cross-process registry/LRU lock
 ├── logs/                          # legacy/default runtime logs
 └── runtimes/
     ├── coder/
@@ -70,7 +71,7 @@ Named runtimes live below the existing base state directory:
         └── logs/
 ```
 
-The base state directory is the value of `COLAB_T4_STATE_DIR` at process startup, or `~/.config/colab-t4` when unset. Selecting a named runtime changes only the runtime-scoped state directory inside the current process. It must never relocate the global account registry or global saved configuration.
+The base state directory is the value of `COLAB_T4_STATE_DIR` at process startup, or `~/.config/colab-t4` when unset. Selecting a named runtime changes only the runtime-scoped state directory inside the current process. It must never relocate the global account registry, OAuth homes, or global saved configuration.
 
 ## Global state versus runtime state
 
@@ -80,9 +81,12 @@ The distinction is deliberate.
 
 These resources are shared by all runtimes:
 
-- `secrets.json` for common Tailscale/Hugging Face/SSH/default configuration;
+- `secrets.json` for common Tailscale/Hugging Face/SSH configuration and the existing legacy/default runtime defaults;
 - `accounts.json` for account health and least-recently-used rotation;
-- `accounts/<id>/` for isolated Colab CLI OAuth/session homes.
+- `accounts/<id>/` for isolated Colab CLI OAuth/session homes;
+- account lock files used to serialize cross-process registry and per-account Colab CLI operations.
+
+The existing `secrets.json` schema is not migrated. Keys that historically describe the default runtime (`api_key`, `model_repo`, `quant`, `session`, `port`, `ctx`) keep serving the legacy/default runtime. A named runtime must not accidentally inherit the legacy `api_key`, `model_repo`, `quant`, or `session` when its own metadata/key exists. Common secrets such as Tailscale/HF/SSH settings remain reusable across named runtimes.
 
 Account health and usage timestamps must remain global so provisioning `coder` changes the same LRU information later used when provisioning `research`.
 
@@ -132,18 +136,18 @@ Creating an already-existing runtime fails without changing files.
 
 ## Configuration precedence
 
-For runtime-specific non-secret values such as session/model/quant, precedence becomes:
+For named-runtime session/model/quant values, precedence becomes:
 
 ```text
 explicit CLI option
 -> environment variable
 -> named runtime metadata
--> global saved default
--> interactive prompt
 -> package default
 ```
 
-For common secrets such as `TS_AUTHKEY` and `HF_TOKEN`, current precedence remains:
+The default runtime keeps the existing v0.4.0 precedence and may continue using legacy values saved in global `secrets.json`.
+
+For common secrets such as `TS_AUTHKEY`, `HF_TOKEN`, Tailscale/SSH configuration, current precedence remains:
 
 ```text
 explicit/environment
@@ -151,19 +155,20 @@ explicit/environment
 -> interactive prompt
 ```
 
-Named runtimes receive an independent generated API key at `runtimes create` time. For API authentication, precedence is:
+Named runtimes receive an independent generated API key at `runtimes create` time. For a named runtime, API authentication precedence is:
 
 ```text
 explicit CLI value
 -> COLAB_T4_API_KEY environment variable
 -> selected runtime's runtime-api-key.json
--> global saved/default API key where legacy compatibility requires it
--> generated/interactive value
+-> generated/interactive replacement if the runtime key is missing
 ```
 
-The default runtime keeps the exact v0.4.0 behavior.
+A named runtime never silently falls back to the legacy/default API key stored in global `secrets.json`.
 
-Persisting common secrets from an interactive named-runtime command must update only global common configuration. Runtime-specific session/model/quant defaults belong in `runtime.json`, not in the global account registry.
+The default runtime keeps the exact v0.4.0 API-key behavior.
+
+Persisting common secrets from an interactive named-runtime command updates only the common global fields. Runtime-specific session/model/quant defaults belong in `runtime.json`; the named runtime API key belongs in its own `runtime-api-key.json`. Existing legacy/default keys in `secrets.json` remain untouched unless a default-runtime configuration flow explicitly changes them.
 
 ## CLI surface
 
@@ -250,15 +255,24 @@ Introduce a small runtime namespace module responsible for:
 - enumerating named runtimes;
 - entering a selected runtime context for existing state/config/lifecycle code.
 
-The existing lifecycle/model/API/SSH/log code continues to call the normal state helpers. During a selected runtime context those helpers resolve runtime-scoped state/API-key/log paths while global account/config helpers continue resolving against the immutable base directory.
+The existing lifecycle/model/API/SSH/log code continues to call the normal runtime-state helpers. During a selected runtime context those helpers resolve runtime-scoped state/API-key/log paths while global account/config helpers continue resolving against the immutable base directory.
 
-This minimizes changes to the already-tested provisioning and rollback logic.
+Config helpers therefore need an explicit split between base/global paths and selected-runtime paths. This is a targeted path-resolution refactor, not a rewrite of lifecycle orchestration.
 
 ## Concurrency model
 
-Separate CLI processes are naturally isolated because each process selects its own runtime namespace.
+Separate CLI processes are namespace-isolated, but they still share account metadata and Colab CLI account homes. Atomic JSON replacement alone is insufficient for read-modify-write LRU updates.
 
-The stdio MCP server is one process, so temporarily selecting a namespace through process-local configuration must be serialized by an internal re-entrant lock/context manager. The lock covers namespace selection plus the complete tool operation and restores the previous selection in `finally`.
+The implementation must use stdlib `fcntl.flock` on Linux for cross-process coordination:
+
+1. `accounts.lock` protects account-registry read/modify/write and account selection.
+2. Selecting the next account for a new provisioning attempt occurs under that lock and immediately advances/reserves its `last_used_at`, so two concurrent runtime starts choose different healthy accounts when alternatives exist.
+3. A per-account operation lock serializes Colab CLI operations that mutate/read the same isolated account HOME/session registry. This avoids concurrent corruption when only one account exists or multiple runtimes legitimately share an account.
+4. Failure/success updates occur under the registry lock.
+
+Locks are advisory local filesystem locks and introduce no new dependency. Lock acquisition must have bounded error handling and always release in `finally`/context-manager exit.
+
+The stdio MCP server is one process, so temporarily selecting a namespace through process-local configuration must additionally be serialized by an internal re-entrant thread lock/context manager. The lock covers namespace selection plus the complete tool operation and restores the previous selection in `finally`.
 
 This prevents simultaneous MCP calls from causing `coder` to read or mutate `research` state.
 
@@ -299,7 +313,7 @@ For any named runtime `A` and `B`:
 - `ssh(A)` uses only A's Tailscale address;
 - B remains usable if an A lifecycle operation fails.
 
-Shared account-LRU updates are the only expected cross-runtime writes during lifecycle operations.
+Shared account-LRU/health updates and serialized access to shared account OAuth/session homes are the only expected cross-runtime coordination during lifecycle operations.
 
 ## Model switching
 
@@ -323,18 +337,19 @@ A missing named runtime never falls back to `default`.
 
 A corrupt named-runtime metadata file is a hard error for mutation commands and a non-fatal `invalid` entry for `runtimes list`.
 
-Runtime context restoration occurs in `finally`, including when lifecycle/model operations throw.
+Runtime context restoration and all file/account locks are released in `finally`/context-manager exit, including when lifecycle/model operations throw.
 
 ## Security
 
 - Validate runtime IDs before any path construction.
 - Runtime directories are mode `0700`.
-- `runtime.json`, `state.json`, and API-key files use existing atomic mode-`0600` writes.
+- `runtime.json`, `state.json`, lock files, and API-key files use restrictive permissions; JSON writes remain atomic mode `0600`.
 - Runtime inventories expose only allow-listed non-secret fields.
 - Global account OAuth homes remain outside runtime namespaces.
 - Named runtime selection never changes account HOME paths.
-- Error redaction must include both global secrets and the selected runtime API key.
-- Tests must prove no runtime API key appears in CLI JSON inventory or MCP responses.
+- Named runtimes never inherit the legacy/default API key implicitly.
+- Error redaction includes both global secrets and the selected runtime API key.
+- Tests prove no runtime API key appears in CLI JSON inventory or MCP responses.
 
 ## Testing strategy
 
@@ -352,8 +367,19 @@ Cover:
 - duplicate create rejection;
 - auto-derived unique session names;
 - runtime metadata precedence;
+- named runtime API-key isolation/no legacy fallback;
 - global account/config paths remaining global while runtime state paths change;
 - runtime context restoration after exceptions.
+
+### Account concurrency tests
+
+Cover:
+
+- registry read/modify/write under a cross-process lock;
+- two concurrent claims choose different healthy accounts when two are available;
+- success/failure updates do not lose another process's update;
+- same-account Colab CLI operations are serialized by a per-account lock;
+- lock release after exceptions.
 
 ### CLI tests
 
@@ -422,7 +448,7 @@ v0.5.0 is complete when:
 1. Existing no-runtime CLI/MCP behavior remains green.
 2. At least two named runtime namespaces can coexist in tests without state/API-key/log crossover.
 3. Runtime-specific lifecycle/model commands target only the selected recorded Colab session.
-4. Account rotation remains global across named runtimes.
+4. Account rotation remains global and concurrency-safe across named runtimes.
 5. MCP can list and operate existing named runtimes without exposing secrets.
 6. The full CI matrix passes on the final feature head.
 7. The feature is documented and merged only after final verification.
