@@ -102,6 +102,7 @@ def test_default_runtime_selector_keeps_legacy_context(monkeypatch, tmp_path, ca
 
 def test_named_restart_resolves_runtime_config_before_lifecycle_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
     create_runtime("coder", model_repo="example/coder", quant="Q5_K_M")
     observed = []
 
