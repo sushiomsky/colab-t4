@@ -98,3 +98,29 @@ def test_default_runtime_selector_keeps_legacy_context(monkeypatch, tmp_path, ca
     assert cli.main(["--runtime", "default", "status", "--json"]) == 1
     json.loads(capsys.readouterr().out)
     assert observed == ["default"]
+
+
+def test_named_restart_resolves_runtime_config_before_lifecycle_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    create_runtime("coder", model_repo="example/coder", quant="Q5_K_M")
+    observed = []
+
+    def fake_restart(args):
+        observed.append({
+            "runtime": config.selected_runtime(),
+            "session": args.session,
+            "model": args.model,
+            "quant": args.quant,
+            "api_key": args.api_key,
+            "runtime_config": dict(args.runtime_config),
+        })
+        return {"runtime_state": "ready"}
+
+    monkeypatch.setattr(cli, "lifecycle_restart", fake_restart)
+    assert cli.main(["--runtime", "coder", "restart", "--non-interactive"]) == 0
+    assert observed[0]["runtime"] == "coder"
+    assert observed[0]["session"] == "colab-t4-coder"
+    assert observed[0]["model"] == "example/coder"
+    assert observed[0]["quant"] == "Q5_K_M"
+    assert observed[0]["api_key"]
+    assert observed[0]["runtime_config"]["api_key"] == observed[0]["api_key"]
