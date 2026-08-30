@@ -1,27 +1,24 @@
 """Google Colab account profiles with automatic failover ordering.
 
-Each account profile owns an isolated HOME directory under the colab-t4 state
-directory. The installed Colab CLI reads its credentials from
-``~/.config/colab-cli/token.json`` (and its session registry from
-``~/.config/colab-cli/sessions.json``); overriding HOME for the CLI
-subprocess gives every account its own independent OAuth identity.
-
-The ``default`` account is implicit: it has no HOME override and uses the
-real login home, which preserves the legacy single-account setup. Every other
-account gets ``<state>/accounts/<id>`` as its HOME.
+Each account profile owns an isolated HOME directory under the global colab-t4
+state directory. Named runtime namespaces deliberately share this registry so
+quota/failure/LRU information coordinates all Colab sessions.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .backend import colab_cli_token_path
-from .config import _atomic_json, state_dir
+from .config import _atomic_json, global_state_dir
 
 DEFAULT_ACCOUNT_ID = "default"
 
@@ -51,11 +48,54 @@ class Account:
 
 
 def accounts_path() -> Path:
-    return state_dir() / "accounts.json"
+    return global_state_dir() / "accounts.json"
 
 
-def load_accounts() -> list[Account]:
-    """Load the account registry, bootstrapping the implicit ``default`` account."""
+def account_home_dir(account_id: str) -> Path:
+    return global_state_dir() / "accounts" / account_id
+
+
+def _registry_lock_path() -> Path:
+    return global_state_dir() / "accounts.lock"
+
+
+def _account_lock_path(account_id: str) -> Path:
+    return global_state_dir() / "account-locks" / f"{account_id}.lock"
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a+") as handle:
+            fd = -1
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+@contextmanager
+def _registry_lock() -> Iterator[None]:
+    with _file_lock(_registry_lock_path()):
+        yield
+
+
+@contextmanager
+def account_operation(account_id: str) -> Iterator[None]:
+    if not _ID_RE.fullmatch(account_id):
+        raise ValueError(f"invalid account id '{account_id}'")
+    with _file_lock(_account_lock_path(account_id)):
+        yield
+
+
+def _load_accounts_unlocked() -> list[Account]:
     path = accounts_path()
     accounts: list[Account] = []
     if path.exists():
@@ -64,14 +104,29 @@ def load_accounts() -> list[Account]:
             accounts = [Account.from_dict(item) for item in raw if isinstance(item, dict)]
         except (OSError, json.JSONDecodeError):
             accounts = []
-    if not any(account.id == DEFAULT_ACCOUNT_ID for account in accounts):
-        accounts.insert(0, Account(id=DEFAULT_ACCOUNT_ID))
-        save_accounts(accounts)
     return accounts
 
 
-def save_accounts(accounts: list[Account]) -> None:
+def _save_accounts_unlocked(accounts: list[Account]) -> None:
     _atomic_json(accounts_path(), [account.to_dict() for account in accounts])
+
+
+def _ensure_default_unlocked(accounts: list[Account]) -> list[Account]:
+    if not any(account.id == DEFAULT_ACCOUNT_ID for account in accounts):
+        accounts.insert(0, Account(id=DEFAULT_ACCOUNT_ID))
+        _save_accounts_unlocked(accounts)
+    return accounts
+
+
+def load_accounts() -> list[Account]:
+    """Load the global account registry, bootstrapping ``default`` atomically."""
+    with _registry_lock():
+        return _ensure_default_unlocked(_load_accounts_unlocked())
+
+
+def save_accounts(accounts: list[Account]) -> None:
+    with _registry_lock():
+        _save_accounts_unlocked(accounts)
 
 
 def get_account(account_id: str) -> Account:
@@ -82,53 +137,53 @@ def get_account(account_id: str) -> Account:
 
 
 def add_account(account_id: str, *, home: str | None, email: str = "") -> Account:
-    if not _ID_RE.match(account_id):
+    if not _ID_RE.fullmatch(account_id):
         raise ValueError("account id must start with a letter or digit and use only letters, digits, '.', '_', '-'")
-    accounts = load_accounts()
-    if any(account.id == account_id for account in accounts):
-        raise ValueError(f"account '{account_id}' already exists")
-    account = Account(
-        id=account_id,
-        email=email,
-        home=home,
-        added_at=_now(),
-    )
-    accounts.append(account)
-    save_accounts(accounts)
-    return account
+    with _registry_lock():
+        accounts = _ensure_default_unlocked(_load_accounts_unlocked())
+        if any(account.id == account_id for account in accounts):
+            raise ValueError(f"account '{account_id}' already exists")
+        account = Account(
+            id=account_id,
+            email=email,
+            home=home,
+            added_at=_now(),
+        )
+        accounts.append(account)
+        _save_accounts_unlocked(accounts)
+        return account
 
 
 def remove_account(account_id: str) -> None:
-    accounts = load_accounts()
-    remaining = [account for account in accounts if account.id != account_id]
-    if len(remaining) == len(accounts):
-        raise KeyError(f"account '{account_id}' is not registered")
-    if account_id == DEFAULT_ACCOUNT_ID:
-        raise ValueError("the 'default' account is implicit and cannot be removed")
-    save_accounts(remaining)
-
-
-def account_home_dir(account_id: str) -> Path:
-    return state_dir() / "accounts" / account_id
+    with _registry_lock():
+        accounts = _ensure_default_unlocked(_load_accounts_unlocked())
+        remaining = [account for account in accounts if account.id != account_id]
+        if len(remaining) == len(accounts):
+            raise KeyError(f"account '{account_id}' is not registered")
+        if account_id == DEFAULT_ACCOUNT_ID:
+            raise ValueError("the 'default' account is implicit and cannot be removed")
+        _save_accounts_unlocked(remaining)
 
 
 def record_success(account_id: str) -> None:
-    accounts = load_accounts()
-    for account in accounts:
-        if account.id == account_id:
-            account.last_error = ""
-            account.last_ok = _now()
-            account.last_used_at = _now()
-    save_accounts(accounts)
+    with _registry_lock():
+        accounts = _ensure_default_unlocked(_load_accounts_unlocked())
+        for account in accounts:
+            if account.id == account_id:
+                account.last_error = ""
+                account.last_ok = _now()
+                account.last_used_at = _now()
+        _save_accounts_unlocked(accounts)
 
 
 def record_failure(account_id: str, error: str) -> None:
-    accounts = load_accounts()
-    for account in accounts:
-        if account.id == account_id:
-            account.last_error = error[:500]
-            account.last_used_at = _now()
-    save_accounts(accounts)
+    with _registry_lock():
+        accounts = _ensure_default_unlocked(_load_accounts_unlocked())
+        for account in accounts:
+            if account.id == account_id:
+                account.last_error = error[:500]
+                account.last_used_at = _now()
+        _save_accounts_unlocked(accounts)
 
 
 def _now() -> str:
@@ -137,21 +192,7 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def candidate_accounts(session: str, state: dict[str, Any]) -> list[Account]:
-    """Order accounts for a provisioning attempt.
-
-    - Healthy accounts (no recorded last error) come before errored ones.
-    - Within each group, the least-recently-used account comes first, so
-      concurrent sessions round-robin across accounts (a second T4 lands on
-      the next account instead of stacking on one).
-    - When the requested session is already recorded, the account hosting it
-      is tried first (affinity) as long as it is healthy, then the rotation
-      continues. A hosting account with a recorded failure never jumps the
-      queue, so re-provisioning a dead session moves straight to the next
-      account.
-    """
-    accounts = load_accounts()
-
+def _ordered_accounts(accounts: list[Account], session: str, state: dict[str, Any]) -> list[Account]:
     def sort_key(account: Account) -> tuple[int, str]:
         return (1 if account.last_error else 0, account.last_used_at or "")
 
@@ -162,6 +203,29 @@ def candidate_accounts(session: str, state: dict[str, Any]) -> list[Account]:
         if first is not None and not first.last_error:
             ordered = [first] + [account for account in ordered if account.id != active]
     return ordered
+
+
+def candidate_accounts(session: str, state: dict[str, Any]) -> list[Account]:
+    """Order accounts for a provisioning attempt without reserving one."""
+    return _ordered_accounts(load_accounts(), session, state)
+
+
+def claim_candidate_account(
+    session: str,
+    state: dict[str, object],
+    excluded: set[str] | None = None,
+) -> Account:
+    """Atomically select and LRU-reserve the next account for provisioning."""
+    excluded = excluded or set()
+    with _registry_lock():
+        accounts = _ensure_default_unlocked(_load_accounts_unlocked())
+        ordered = _ordered_accounts(accounts, session, state)
+        chosen = next((account for account in ordered if account.id not in excluded), None)
+        if chosen is None:
+            raise RuntimeError("no Colab accounts available for provisioning")
+        chosen.last_used_at = _now()
+        _save_accounts_unlocked(accounts)
+        return Account.from_dict(chosen.to_dict())
 
 
 def resolve_account_email(home: str | None) -> str | None:
