@@ -9,6 +9,7 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
@@ -16,9 +17,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package and tests
+      - name: Install base package and tests
         run: python -m pip install -U pip && python -m pip install -e '.[test]'
       - name: Run tests
         run: pytest -q
       - name: Compile package
         run: python -m compileall -q colab_t4
+      - name: Smoke-test CLI metadata
+        run: colab-t4 --version && colab-t4 model --help
+
+  mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package with current MCP SDK
+        run: python -m pip install -U pip && python -m pip install -e '.[test,mcp]'
+      - name: Run tests with MCP installed
+        run: pytest -q
+      - name: Build MCP server with real SDK
+        run: |
+          python - <<'PY'
+          from colab_t4.mcp_server import build_server
+          server = build_server()
+          print(type(server).__name__)
+          PY
