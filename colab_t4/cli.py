@@ -318,8 +318,18 @@ def cmd_down(_args: argparse.Namespace) -> int:
 
 
 def cmd_restart(args: argparse.Namespace) -> int:
+    interactive = interactive_available(getattr(args, "interactive", False)) and not getattr(args, "non_interactive", False)
     try:
+        values = collect(args, force=False, allow_prompt=interactive)
+        for key, value in values.items():
+            setattr(args, key, value)
+        args.runtime_config = values
+        persist(values)
         lifecycle_restart(args)
+        save_runtime_api_key(values["api_key"])
+    except (EOFError, KeyboardInterrupt):
+        print("Setup cancelled.", file=sys.stderr)
+        return 130
     except (RuntimeError, ColabCLIError, TimeoutError) as exc:
         fail(redact(str(exc)))
     print("runtime restarted")
