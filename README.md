@@ -117,6 +117,7 @@ colab-t4 api      print API base URL and shell-safe usage
 colab-t4 restart  stop the recorded session and create a new one
 colab-t4 down     stop exactly the recorded session; idempotent local cleanup
 colab-t4 doctor   validate Colab CLI, auth, SSH, and Tailscale configuration
+colab-t4 serve    run the local OpenAI-compatible router (Colab/Ollama dispatch)
 ```
 
 For integrations that manage account selection themselves, `up` and `restart`
@@ -226,6 +227,21 @@ colab-t4 accounts add --id personal --email you@gmail.com
 colab-t4 accounts remove work     # unregister and delete the profile
 ```
 
+For automation, integrations, and tools that cannot drive an interactive browser
+flow, `auth-import` registers a profile from an existing Colab CLI `token.json`:
+
+```bash
+colab-t4 accounts auth-import --id work --token ~/.config/colab-cli/token.json
+colab-t4 accounts auth-import --id work --token token.json --email you@gmail.com
+```
+
+The token is copied into the account's isolated HOME, verified with
+`colab sessions`, and its Google account email is resolved automatically.
+If verification fails the account directory is cleaned up and no profile is
+registered. This is the non-interactive counterpart to `accounts add`: use it
+when a token.json was obtained from a separate browser-based OAuth session or
+captured from another Colab CLI installation.
+
 Each added account gets its own isolated HOME directory
 (`~/.config/colab-t4/accounts/<id>`), so its Colab OAuth token, session
 registry, and history are completely independent of the other accounts.
@@ -247,6 +263,161 @@ your real login HOME and cannot be removed. Failover ordering is:
 
 Failures are recorded per account in `~/.config/colab-t4/accounts.json`
 (mode 0600) and shown by `colab-t4 accounts list`.
+
+## Local API router
+
+`colab-t4 serve` runs a local OpenAI-compatible HTTP router that dispatches
+requests to a Colab T4 backend (when a ready runtime is recorded) or a local
+Ollama backend as a fallback. This lets bots, tools, and integrations point at
+a single stable endpoint regardless of which backend is currently live.
+
+```bash
+colab-t4 serve
+colab-t4 serve --host 127.0.0.1 --port 8089
+```
+
+By default, `serve` asks the local Tailscale CLI for `tailscale ip -4` and
+binds to that Tailscale IPv4 address when one is available. On machines without
+Tailscale, it falls back to `127.0.0.1` so local development and tests remain
+usable. Explicit loopback binds and explicit Tailscale CGNAT IPv4 binds are
+accepted directly:
+
+```bash
+colab-t4 serve --host 100.96.1.23 --port 8089
+colab-t4 serve --host localhost --port 8089
+```
+
+Binding to a wildcard, LAN, public, or other non-tailnet address is refused
+unless you explicitly acknowledge the exposure:
+
+```bash
+colab-t4 serve --host 0.0.0.0 --port 8089 --allow-non-tailnet-bind
+```
+
+On startup the router reads the recorded runtime state from
+`~/.config/colab-t4/state.json`. When a runtime is ready, the Colab API base URL
+and key are used. Otherwise (or when the Colab API is unhealthy) the router
+falls back to Ollama, whose URL is set via `OLLAMA_HOST` / `OLLAMA_BASE` or
+defaults to `http://127.0.0.1:11434`.
+
+Each incoming OpenAI-compatible request is probed against available backends in
+order; the first healthy backend receives the request. The proxy accepts the
+normal OpenAI-compatible `GET` and `POST` methods, rejects oversized request
+bodies, and injects the Colab bearer key when present. It does not forward
+`Host`, `Content-Length`, `Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+`Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, or any
+extension header named by the incoming `Connection` header.
+
+The router exposes a `GET /health` endpoint that reports the active backend,
+returning HTTP 200 when at least one backend is healthy and 503 otherwise.
+
+Tailscale access examples:
+
+```bash
+TAILSCALE_IP=$(tailscale ip -4)
+curl -fsS "http://$TAILSCALE_IP:8089/health"
+curl -fsS "http://$TAILSCALE_IP:8089/v1/models" \
+  -H "Authorization: Bearer $COLAB_T4_API_KEY"
+```
+
+### Web management interface
+
+The router also hosts a simple web management UI. Once `colab-t4 serve` is
+running, open `http://<serve-host>:8089/manage` in a browser to manage accounts,
+monitor runtime status, inspect diagnostics, view redacted logs, and control
+backends without the CLI.
+
+The UI provides tabs for overview, runtime lifecycle actions, account OAuth,
+configuration, diagnostics, API smoke tests, logs, and asynchronous jobs.
+Secret fields are write-only: blank secret fields leave existing values
+unchanged, and API responses never include secret values.
+
+All management actions are exposed as JSON API endpoints for programmatic use:
+
+```text
+GET  /api/state             runtime + accounts + backends + secrets summary
+GET  /manage                HTML management UI
+GET  /api/config            redacted configuration summary
+PUT  /api/config            update non-secret config and write-only secrets
+POST /api/up                start provisioning (async)
+POST /api/restart           stop + reprovision the runtime
+POST /api/down              stop the runtime
+GET  /api/jobs              list recent lifecycle jobs
+GET  /api/jobs/<id>         poll one lifecycle job
+POST /api/jobs/<id>/cancel  request cancellation
+GET  /api/status            runtime status diagnostic
+GET  /api/doctor            dependency/auth diagnostic
+GET  /api/logs              bounded redacted local logs
+GET  /api/api/models        run an authenticated models check
+POST /api/api/chat          run an authenticated chat check
+POST /api/accounts          create/import an account profile
+POST /api/accounts/auth-start
+POST /api/accounts/auth-finish
+POST /api/accounts/auth-cancel
+DELETE /api/accounts/<id>   remove a registered account
+```
+
+Management mutations (`POST`, `PUT`, `DELETE`) require same-origin browser
+requests and an `X-Colab-T4-Management-Token` header. For programmatic clients,
+set a token before starting the router:
+
+```bash
+export COLAB_T4_MANAGEMENT_TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
+colab-t4 serve
+```
+
+Then send the token on mutating management requests:
+
+```bash
+curl -fsS "http://$TAILSCALE_IP:8089/api/up" \
+  -X POST \
+  -H "Origin: http://$TAILSCALE_IP:8089" \
+  -H "X-Colab-T4-Management-Token: $COLAB_T4_MANAGEMENT_TOKEN"
+```
+
+Lifecycle operations return job envelopes. Poll the job until it reaches
+`succeeded`, `failed`, or `cancelled`:
+
+```bash
+JOB_ID=$(curl -fsS "http://$TAILSCALE_IP:8089/api/restart" \
+  -X POST \
+  -H "Origin: http://$TAILSCALE_IP:8089" \
+  -H "X-Colab-T4-Management-Token: $COLAB_T4_MANAGEMENT_TOKEN" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])')
+
+curl -fsS "http://$TAILSCALE_IP:8089/api/jobs/$JOB_ID"
+```
+
+Configuration and account OAuth examples:
+
+```bash
+curl -fsS "http://$TAILSCALE_IP:8089/api/config" \
+  -X PUT \
+  -H "Origin: http://$TAILSCALE_IP:8089" \
+  -H "X-Colab-T4-Management-Token: $COLAB_T4_MANAGEMENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"session":"colab-t4","model":"repo/model","api_key":"new-api-key"}'
+
+curl -fsS "http://$TAILSCALE_IP:8089/api/accounts/auth-start" \
+  -X POST \
+  -H "Origin: http://$TAILSCALE_IP:8089" \
+  -H "X-Colab-T4-Management-Token: $COLAB_T4_MANAGEMENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"id":"work"}'
+```
+
+Diagnostics examples:
+
+```bash
+curl -fsS "http://$TAILSCALE_IP:8089/api/status"
+curl -fsS "http://$TAILSCALE_IP:8089/api/doctor"
+curl -fsS "http://$TAILSCALE_IP:8089/api/logs"
+curl -fsS "http://$TAILSCALE_IP:8089/api/api/models"
+```
 
 ## AblitBot provider integration
 

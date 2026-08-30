@@ -124,10 +124,6 @@ def clear_runtime_api_key() -> None:
         pass
 
 
-def save_secrets(data: dict[str, str]) -> None:
-    _atomic_json(secrets_path(), data)
-
-
 def generated_api_key() -> str:
     return secrets.token_urlsafe(32)
 
@@ -147,3 +143,111 @@ def redact(text: str, secret_values: list[str] | None = None) -> str:
     for value in sorted({v for v in values if len(v) >= 4}, key=len, reverse=True):
         text = text.replace(value, "[REDACTED]")
     return text
+
+
+_SECRET_FIELDS = {"tailscale_authkey", "hf_token", "api_key", "ssh_password", "ssh_pubkey"}
+_OPTIONAL_FIELDS = {"tailnet", "hf_token"}
+_NON_SECRET_FIELDS = {"session", "model", "model_repo", "quant", "port", "ctx", "tailnet", "ssh_mode"}
+_CONFIG_FIELDS = _SECRET_FIELDS | _NON_SECRET_FIELDS
+_MODEL_STORAGE_KEY = "model_repo"
+_SSH_MODES = {"tailscale", "password", "key"}
+
+
+def _runtime_defaults() -> dict[str, Any]:
+    from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
+
+    return {
+        "session": DEFAULT_HOSTNAME,
+        "model": DEFAULT_MODEL,
+        "quant": DEFAULT_QUANT,
+        "port": DEFAULT_PORT,
+        "ctx": DEFAULT_CTX,
+        "tailnet": "",
+        "ssh_mode": "tailscale",
+    }
+
+
+def _coerce_positive_int(name: str, value: Any) -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if number <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return str(number)
+
+
+def _coerce_text(name: str, value: Any, *, required: bool = True) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    text = value.strip()
+    if required and not text:
+        raise ValueError(f"{name} is required")
+    return text
+
+
+def _summary_int(saved: dict[str, str], key: str, default: int) -> int:
+    try:
+        return int(saved.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def configuration_summary() -> dict[str, Any]:
+    """Return saved configuration without exposing secret values."""
+    saved = load_secrets()
+    defaults = _runtime_defaults()
+    return {
+        "session": saved.get("session") or defaults["session"],
+        "model": saved.get("model_repo") or saved.get("model") or defaults["model"],
+        "quant": saved.get("quant") or defaults["quant"],
+        "port": _summary_int(saved, "port", defaults["port"]),
+        "ctx": _summary_int(saved, "ctx", defaults["ctx"]),
+        "tailnet": saved.get("tailnet", defaults["tailnet"]),
+        "ssh_mode": saved.get("ssh_mode") or defaults["ssh_mode"],
+        "secrets": {
+            "tailscale_authkey": bool(saved.get("tailscale_authkey")),
+            "hf_token": bool(saved.get("hf_token")),
+            "api_key": bool(saved.get("api_key")),
+            "ssh_password": bool(saved.get("ssh_password")),
+            "ssh_pubkey": bool(saved.get("ssh_pubkey")),
+        },
+    }
+
+
+def update_configuration(values: dict[str, Any]) -> dict[str, Any]:
+    """Persist allowlisted configuration values and return a redacted summary."""
+    if not isinstance(values, dict):
+        raise ValueError("configuration payload must be an object")
+    unknown = sorted(set(values) - _CONFIG_FIELDS)
+    if unknown:
+        raise ValueError("unknown configuration field: " + unknown[0])
+
+    saved = load_secrets()
+    updated: dict[str, str] = dict(saved)
+    for key, raw_value in values.items():
+        storage_key = _MODEL_STORAGE_KEY if key == "model" else key
+        if key in {"port", "ctx"}:
+            updated[storage_key] = _coerce_positive_int(key, raw_value)
+            continue
+        if key == "ssh_mode":
+            mode = _coerce_text(key, raw_value)
+            if mode not in _SSH_MODES:
+                raise ValueError("ssh_mode must be tailscale, password, or key")
+            updated[storage_key] = mode
+            continue
+        if key in _SECRET_FIELDS:
+            updated[storage_key] = _coerce_text(key, raw_value, required=key not in _OPTIONAL_FIELDS)
+            continue
+        updated[storage_key] = _coerce_text(key, raw_value, required=key not in _OPTIONAL_FIELDS)
+    save_secrets(updated)
+    return configuration_summary()
+
+
+def reset_configuration(confirmed: bool) -> None:
+    """Clear saved configuration only after an explicit confirmation flag."""
+    if confirmed is not True:
+        raise ValueError("confirmation is required")
+    clear_secrets()

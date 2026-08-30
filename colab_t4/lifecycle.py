@@ -27,6 +27,12 @@ from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT
 REMOTE_SECRET = "/content/.colab-t4-secrets.json"
 REMOTE_NOTEBOOK = "/content/colab-t4.ipynb"
 REMOTE_READY = "/content/.colab-t4-ready.json"
+CancellationCallback = Callable[[], bool]
+
+
+def _check_cancelled(cancelled: CancellationCallback | None) -> None:
+    if cancelled and cancelled():
+        raise InterruptedError("operation cancelled")
 
 
 def _ready_is_valid(ready: dict[str, Any]) -> bool:
@@ -150,13 +156,20 @@ def _make_notebook(options: Any, path: Path) -> None:
     os.chmod(path, 0o600)
 
 
-def _download_ready(cli: ColabCLI, session: str, secrets: list[str]) -> dict[str, Any] | None:
+def _download_ready(
+    cli: ColabCLI,
+    session: str,
+    secrets: list[str],
+    cancelled: CancellationCallback | None = None,
+) -> dict[str, Any] | None:
+    _check_cancelled(cancelled)
     target = logs_dir() / "runtime-ready.json"
     try:
         target.unlink()
     except FileNotFoundError:
         pass
     result = cli.run(cli.download_command(session, REMOTE_READY, target), _log("runtime"), timeout=60, secrets=secrets)
+    _check_cancelled(cancelled)
     if result.returncode or not target.exists():
         return None
     try:
@@ -166,7 +179,8 @@ def _download_ready(cli: ColabCLI, session: str, secrets: list[str]) -> dict[str
         return None
 
 
-def up(options: Any) -> dict[str, Any]:
+def up(options: Any, cancelled: CancellationCallback | None = None) -> dict[str, Any]:
+    _check_cancelled(cancelled)
     session = _session_name(options)
     current = load_state()
     if current.get("session") == session and current.get("runtime_state") in {"creating", "executing", "ready"}:
@@ -177,6 +191,8 @@ def up(options: Any) -> dict[str, Any]:
         # rotation below.  This is deliberately the same failover path used
         # for a fresh `up`, so model/session configuration is preserved.
         try:
+            if cancelled:
+                return wait(options, cancelled=cancelled)
             return wait(options)
         except (ColabCLIError, RuntimeError, TimeoutError) as exc:
             active = current.get("account")
@@ -199,6 +215,9 @@ def up(options: Any) -> dict[str, Any]:
     failures: list[str] = []
     for index, account in enumerate(accounts):
         try:
+            _check_cancelled(cancelled)
+            if cancelled:
+                return _provision(options, session, account, cancelled=cancelled)
             return _provision(options, session, account)
         except (ColabCLIError, RuntimeError, TimeoutError) as exc:
             if len(accounts) == 1:
@@ -211,7 +230,12 @@ def up(options: Any) -> dict[str, Any]:
     raise RuntimeError("all accounts failed: " + " | ".join(failures))
 
 
-def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
+def _provision(
+    options: Any,
+    session: str,
+    account: Any,
+    cancelled: CancellationCallback | None = None,
+) -> dict[str, Any]:
     cli = ColabCLI.discover(home=account.home)
     if not authenticate_available(account.home):
         raise RuntimeError(
@@ -222,30 +246,38 @@ def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
     notebook = Path(notebook_name)
     secret_file = None
     try:
+        _check_cancelled(cancelled)
         _make_notebook(options, notebook)
         secret_file, remote_config = _write_secret_file(options, session)
         secret_values = [str(value) for value in remote_config.values() if isinstance(value, str)]
         _update(session=session, account=account.id, runtime_state="creating", accelerator="T4", notebook="submitted", last_error=None, started_at=now())
         created = cli.run(cli.new_command(session, "T4"), _log("colab"), timeout=300, secrets=secret_values)
+        _check_cancelled(cancelled)
         if created.returncode:
             _update(runtime_state="failed", last_error="Colab CLI failed to create the T4 session")
             raise ColabCLIError("Colab CLI could not create the T4 session; see colab.log")
         _update(runtime_state="uploading")
         uploaded = cli.run(cli.upload_command(session, secret_file, REMOTE_SECRET), _log("colab"), timeout=120, secrets=secret_values)
+        _check_cancelled(cancelled)
         if uploaded.returncode:
             _update(runtime_state="failed", last_error="secret upload failed")
             raise ColabCLIError("failed to upload provisioning configuration")
         uploaded_nb = cli.run(cli.upload_command(session, notebook, REMOTE_NOTEBOOK), _log("colab"), timeout=120, secrets=secret_values)
+        _check_cancelled(cancelled)
         if uploaded_nb.returncode:
             _update(runtime_state="failed", last_error="notebook upload failed")
             raise ColabCLIError("failed to upload notebook")
         _update(runtime_state="executing")
         exec_timeout = getattr(options, "exec_timeout", None) or 7200
         executed = cli.run(cli.exec_command(session, notebook, float(exec_timeout)), _log("notebook"), timeout=float(exec_timeout) + 120, secrets=secret_values)
+        _check_cancelled(cancelled)
         if executed.returncode:
             _update(runtime_state="failed", last_error="remote notebook execution failed")
             raise ColabCLIError("remote provisioning failed; inspect `colab-t4 logs notebook`")
-        ready = _download_ready(cli, session, secret_values)
+        if cancelled:
+            ready = _download_ready(cli, session, secret_values, cancelled=cancelled)
+        else:
+            ready = _download_ready(cli, session, secret_values)
         if not ready or not _ready_is_valid(ready):
             _update(runtime_state="failed", last_error="readiness artifact missing or smoke test failed")
             raise ColabCLIError("remote provisioning completed without a valid readiness artifact")
@@ -267,7 +299,7 @@ def _provision(options: Any, session: str, account: Any) -> dict[str, Any]:
                 pass
 
 
-def wait(options: Any) -> dict[str, Any]:
+def wait(options: Any, cancelled: CancellationCallback | None = None) -> dict[str, Any]:
     state = load_state()
     cli = ColabCLI.discover(home=_account_home(state))
     session = getattr(options, "session", None) or state.get("session")
@@ -275,6 +307,7 @@ def wait(options: Any) -> dict[str, Any]:
         raise RuntimeError("no recorded Colab session; run `colab-t4 up`")
     deadline = time.monotonic() + float(getattr(options, "timeout", 600))
     while time.monotonic() < deadline:
+        _check_cancelled(cancelled)
         state = load_state()
         state["session"] = session
         status = cli.run(cli.status_command(session), _log("status"), timeout=45, secrets=_secret_values())
@@ -282,17 +315,24 @@ def wait(options: Any) -> dict[str, Any]:
             state["runtime_state"] = "stopped"
             save_state(state)
             raise RuntimeError("Colab session is not reachable; inspect `colab-t4 logs status`")
-        ready = _download_ready(cli, session, _secret_values())
+        if cancelled:
+            ready = _download_ready(cli, session, _secret_values(), cancelled=cancelled)
+        else:
+            ready = _download_ready(cli, session, _secret_values())
         if ready and _ready_is_valid(ready):
             state.update({"runtime_state": "ready", "gpu": ready.get("gpu"), "tailscale_ip": ready.get("tailscale_ip"), "api_base": ready.get("api_base"), "model": ready.get("model"), "runtime": ready.get("runtime", state.get("runtime", "llama-cpp-python")), "llama_cpp_commit": ready.get("llama_cpp_commit", state.get("llama_cpp_commit")), "llama_cpp_python_version": ready.get("llama_cpp_python_version", state.get("llama_cpp_python_version")), "native_error": ready.get("native_error", state.get("native_error")), "tests": ready.get("tests"), "last_error": None, "ready_at": state.get("ready_at") or now()})
             save_state(state)
             return state
         state["runtime_state"] = "waiting"
         save_state(state)
-        time.sleep(5)
+        wake_at = time.monotonic() + 5
+        while time.monotonic() < wake_at:
+            _check_cancelled(cancelled)
+            time.sleep(min(0.1, wake_at - time.monotonic()))
     raise TimeoutError(f"timed out waiting for Colab session '{session}'")
 
-def down() -> None:
+def down(cancelled: CancellationCallback | None = None) -> None:
+    _check_cancelled(cancelled)
     state = load_state()
     session = state.get("session")
     if not session:
@@ -300,6 +340,7 @@ def down() -> None:
         return
     cli = ColabCLI.discover(home=_account_home(state))
     result = cli.run(cli.stop_command(session), _log("colab"), timeout=120, secrets=_secret_values())
+    _check_cancelled(cancelled)
     # Colab stop is idempotent in the CLI; even an already-lost session must not
     # leave local runtime state behind.
     if result.returncode and "not found" not in (result.stdout + result.stderr).lower():
@@ -309,9 +350,9 @@ def down() -> None:
     clear_runtime_api_key()
 
 
-def restart(options: Any) -> dict[str, Any]:
+def restart(options: Any, cancelled: CancellationCallback | None = None) -> dict[str, Any]:
     try:
-        down()
+        down(cancelled=cancelled)
     except RuntimeError:
         pass
-    return up(options)
+    return up(options, cancelled=cancelled)

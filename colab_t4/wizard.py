@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .backend import ColabCLI, ColabCLIError, auth_summary, authenticate_available
-from .config import generated_api_key, generated_password, load_secrets, save_secrets, clear_secrets
+from .config import configuration_summary, generated_api_key, generated_password, load_secrets, reset_configuration, save_secrets
 from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
 
 Input = Callable[[str], str]
@@ -212,15 +212,16 @@ def persist(values: dict[str, Any]) -> None:
 
 
 def configure_status() -> dict[str, bool | str]:
-    saved = load_secrets()
+    summary = configuration_summary()
+    secrets = summary["secrets"]
     return {
-        "tailscale_authkey": bool(saved.get("tailscale_authkey")),
-        "tailnet": bool(saved.get("tailnet")),
-        "hf_token": bool(saved.get("hf_token")),
-        "api_key": bool(saved.get("api_key")),
-        "ssh_mode": saved.get("ssh_mode", "tailscale"),
-        "ssh_password": bool(saved.get("ssh_password")),
-        "ssh_pubkey": bool(saved.get("ssh_pubkey")),
+        "tailscale_authkey": bool(secrets["tailscale_authkey"]),
+        "tailnet": bool(summary["tailnet"]),
+        "hf_token": bool(secrets["hf_token"]),
+        "api_key": bool(secrets["api_key"]),
+        "ssh_mode": summary["ssh_mode"],
+        "ssh_password": bool(secrets["ssh_password"]),
+        "ssh_pubkey": bool(secrets["ssh_pubkey"]),
     }
 
 
@@ -228,6 +229,5 @@ def reset(*, yes: bool, input_fn: Input = input) -> None:
     if not yes and interactive_available(False) and not _yes("Delete saved colab-t4 credentials?", default=False, input_fn=input_fn):
         print("Reset cancelled.")
         return
-    clear_saved = __import__("colab_t4.config", fromlist=["clear_secrets"]).clear_secrets
-    clear_saved()
+    reset_configuration(True)
     print("Saved credentials removed.")

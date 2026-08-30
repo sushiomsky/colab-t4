@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import signal
@@ -16,10 +17,12 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
+from . import services
 from .accounts import account_home_dir, add_account, get_account, load_accounts, next_account_id, remove_account, resolve_account_email
-from .backend import ColabCLI, ColabCLIError
+from .backend import ColabCLI, ColabCLIError, import_token
 from .config import _atomic_json, load_secrets, load_state, logs_dir, redact, save_runtime_api_key, state_dir
 from .notebook import DEFAULT_CTX, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
+from .router import serve as router_serve
 from .lifecycle import doctor as lifecycle_doctor
 from .lifecycle import down as lifecycle_down
 from .lifecycle import restart as lifecycle_restart
@@ -171,14 +174,9 @@ def print_connections() -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    result, code = lifecycle_doctor()
-    should_interact = not args.json and interactive_available(getattr(args, "interactive", False))
-    if should_interact and not result.get("checks", {}).get("colab_auth"):
-        try:
-            ensure_colab_auth(interactive=True)
-            result, code = lifecycle_doctor()
-        except (RuntimeError, EOFError, KeyboardInterrupt) as exc:
-            print(redact(str(exc)), file=sys.stderr)
+    result, code = services.run_doctor(
+        interactive=not args.json and interactive_available(getattr(args, "interactive", False)),
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
@@ -237,14 +235,14 @@ def cmd_up(args: argparse.Namespace) -> int:
             return 130
         persist(values)
         save_runtime_api_key(values["api_key"])
-        lifecycle_up(args)
+        services.runtime_up(args)
     except (EOFError, KeyboardInterrupt):
         print("Setup cancelled.", file=sys.stderr)
         return 130
     except (RuntimeError, ColabCLIError, TimeoutError) as exc:
         fail(redact(str(exc)))
     print("runtime ready")
-    print_status(_status()[0], False)
+    print_status(services.runtime_status(), False)
     print_connections()
     return 0
 
@@ -261,13 +259,9 @@ def cmd_api(args: argparse.Namespace) -> int:
     if args.action is None:
         print_connections()
     elif args.action == "models":
-        print(json.dumps(_api_request("models"), indent=2))
+        print(json.dumps(services.api_models(), indent=2))
     else:
-        response = _api_request("chat/completions", method="POST", payload={
-            "model": "local",
-            "messages": [{"role": "user", "content": args.message}],
-            "max_tokens": 32,
-        })
+        response = services.api_chat(args.message)
         print(json.dumps(response, indent=2))
     return 0
 
@@ -308,7 +302,8 @@ def cmd_ssh(raw: list[str]) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    result, code = _status()
+    result = services.runtime_status()
+    code = result.pop("exit_code")
     print_status(result, args.json)
     return code
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -327,16 +322,83 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def cmd_down(_args: argparse.Namespace) -> int:
     try:
-        lifecycle_down()
+        services.runtime_down()
     except (RuntimeError, ColabCLIError) as exc:
         fail(redact(str(exc)))
     print("runtime stopped")
     return 0
 
 
+_TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_local_bind_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_tailnet_ipv4(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.version == 4 and address in _TAILSCALE_IPV4_NETWORK
+
+
+def _tailscale_ipv4() -> str | None:
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        candidate = line.strip()
+        if _is_tailnet_ipv4(candidate):
+            return candidate
+    return None
+
+
+def _resolve_serve_host(explicit_host: str | None, allow_non_tailnet_bind: bool) -> str:
+    host = explicit_host or _tailscale_ipv4() or "127.0.0.1"
+    if _is_local_bind_host(host) or _is_tailnet_ipv4(host) or allow_non_tailnet_bind:
+        return host
+    fail(
+        f"refusing to bind serve to non-tailnet host {host!r}; "
+        "use --allow-non-tailnet-bind to acknowledge external exposure"
+    )
+    raise AssertionError("unreachable")
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    host = _resolve_serve_host(
+        getattr(args, "host", None),
+        bool(getattr(args, "allow_non_tailnet_bind", False)),
+    )
+    port = int(getattr(args, "port", None) or "8089")
+    print(f"starting OpenAI-compatible router on {host}:{port}")
+    print("  - Colab backend: used when a ready runtime is recorded (state.json)")
+    print("  - Ollama backend: fallback via OLLAMA_HOST or http://127.0.0.1:11434")
+    try:
+        router_serve(host=host, port=port)
+    except (RuntimeError, OSError) as exc:
+        fail(redact(str(exc)))
+    return 0
+
+
 def cmd_restart(args: argparse.Namespace) -> int:
     try:
-        lifecycle_restart(args)
+        services.runtime_restart(args)
     except (RuntimeError, ColabCLIError, TimeoutError) as exc:
         fail(redact(str(exc)))
     print("runtime restarted")
@@ -621,6 +683,41 @@ def _accounts_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _accounts_auth_import(args: argparse.Namespace) -> int:
+    """Import an existing Colab OAuth ``token.json`` as a new account profile.
+
+    This lets integrations and tools register a Google profile non-interactively
+    from a pre-existing credential file (e.g. a token.json captured from another
+    Colab CLI, or a token obtained via a separate browser session). The token is
+    copied into the account's isolated HOME so it is independent of other
+    profiles, then verified with ``colab sessions`` before registration.
+    """
+    account_id = args.id or next_account_id()
+    if account_id == "default":
+        fail("'default' is the implicit legacy account; choose a different id")
+    token_source = Path(args.token)
+    if not token_source.is_file():
+        fail(f"token file does not exist: {token_source}")
+    home_dir = account_home_dir(account_id)
+    try:
+        home_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        fail(f"an account directory for '{account_id}' already exists; pick a different --id")
+    cli = ColabCLI.discover(home=str(home_dir))
+    if not import_token(str(token_source), str(home_dir)):
+        shutil.rmtree(home_dir, ignore_errors=True)
+        fail("token file was empty; no account was added")
+    ok, reason = _auth_ok(cli, str(home_dir))
+    if not ok:
+        shutil.rmtree(home_dir, ignore_errors=True)
+        fail(f"imported token verification failed: {reason}; the account directory has been cleaned up")
+    email = resolve_account_email(str(home_dir)) or args.email or ""
+    add_account(account_id, home=str(home_dir), email=email)
+    print(json.dumps({"account_id": account_id, "email": email, "status": "added"}))
+    print("The account is now part of the automatic failover rotation.")
+    return 0
+
+
 def cmd_accounts(args: argparse.Namespace) -> int:
     if args.accounts_command == "list":
         return _accounts_list(args)
@@ -634,6 +731,8 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         return _accounts_auth_cancel(args)
     if args.accounts_command == "remove":
         return _accounts_remove(args)
+    if args.accounts_command == "auth-import":
+        return _accounts_auth_import(args)
     return 1
 
 
@@ -671,6 +770,14 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--wait-health", action="store_true")
     wait.add_argument("--json", action="store_true")
     sub.add_parser("down", help="stop the recorded runtime")
+    serve = sub.add_parser("serve", help="run the local OpenAI-compatible router (Colab/Ollama)")
+    serve.add_argument("--host", default=None)
+    serve.add_argument("--port", type=int, default=8089)
+    serve.add_argument(
+        "--allow-non-tailnet-bind",
+        action="store_true",
+        help="allow binding serve to a non-local, non-Tailscale address",
+    )
     restart = sub.add_parser("restart", help="stop and recreate the runtime")
     restart.add_argument("--session", default=None)
     restart.add_argument("--account", default=None, help="try this registered Google account first")
@@ -716,6 +823,10 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_remove = accounts_sub.add_parser("remove", help="remove an account profile")
     accounts_remove.add_argument("account")
     accounts_remove.add_argument("--yes", action="store_true")
+    accounts_auth_import = accounts_sub.add_parser("auth-import", help="import an existing OAuth token.json as a non-interactive profile")
+    accounts_auth_import.add_argument("--id")
+    accounts_auth_import.add_argument("--token", required=True, help="path to a Colab CLI token.json to import")
+    accounts_auth_import.add_argument("--email")
     return parser
 
 
@@ -724,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "ssh":
         return cmd_ssh(argv[1:])
     args = build_parser().parse_args(argv)
-    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
+    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "serve": cmd_serve, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
     return handlers[args.command](args)
 
 

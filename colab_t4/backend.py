@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -146,3 +147,34 @@ def auth_summary(home: str | None = None) -> dict[str, object]:
 def authenticate_available(home: str | None = None) -> bool:
     info = auth_summary(home)
     return bool(info["oauth_token"] or info["adc_credentials"])
+
+
+def import_token(source: str | Path, home: str | None = None) -> bool:
+    """Import a Colab CLI ``token.json`` into a target HOME directory.
+
+    Copies the source token to ``<home>/.config/colab-cli/token.json`` with
+    mode 0600. When ``home`` is None the real user home is used. Returns True
+    if a token file was written, False if the source did not exist or was
+    empty.
+    """
+    target = colab_cli_token_path(home)
+    source = Path(source)
+    if not source.is_file():
+        return False
+    payload = source.read_bytes()
+    if not payload.strip():
+        return False
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".token.", dir=target.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    return True
