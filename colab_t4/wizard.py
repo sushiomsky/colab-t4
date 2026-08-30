@@ -12,9 +12,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from . import config
 from .backend import ColabCLI, ColabCLIError, auth_summary, authenticate_available
-from .config import generated_api_key, generated_password, load_secrets, save_secrets, clear_secrets
 from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
+from .runtimes import load_runtime_metadata, update_runtime_metadata
 
 Input = Callable[[str], str]
 
@@ -101,20 +102,51 @@ def collect(
     force: bool = False,
     allow_prompt: bool | None = None,
 ) -> dict[str, Any]:
-    """Collect all runtime values, applying explicit/env/saved/prompt/default precedence."""
-    saved = load_secrets()
+    """Collect runtime values with default-compatible or named-runtime precedence."""
+    runtime_id = config.selected_runtime()
+    global_saved = config.load_saved_secrets()
+    if runtime_id == "default":
+        saved = config.load_secrets()
+        metadata: dict[str, object] = {}
+        saved_session = saved.get("session")
+        saved_model = saved.get("model_repo")
+        saved_quant = saved.get("quant")
+        saved_port: str | int = saved.get("port", DEFAULT_PORT)
+        saved_ctx: str | int = saved.get("ctx", DEFAULT_CTX)
+        api_key = (
+            getattr(options, "api_key", None)
+            or os.environ.get("COLAB_T4_API_KEY")
+            or saved.get("api_key", "")
+        )
+    else:
+        saved = global_saved
+        metadata = load_runtime_metadata(runtime_id)
+        saved_session = str(metadata.get("session") or "")
+        saved_model = str(metadata.get("model_repo") or "")
+        saved_quant = str(metadata.get("quant") or "")
+        saved_port = DEFAULT_PORT
+        saved_ctx = DEFAULT_CTX
+        api_key = (
+            getattr(options, "api_key", None)
+            or os.environ.get("COLAB_T4_API_KEY")
+            or config.load_runtime_api_key()
+        )
+        if not api_key:
+            api_key = config.generated_api_key()
+            config.save_runtime_api_key(api_key)
+
     values: dict[str, Any] = {}
-    values["session"] = getattr(options, "session", None) or os.environ.get("COLAB_T4_SESSION") or saved.get("session") or DEFAULT_HOSTNAME
-    values["model"] = getattr(options, "model", None) or os.environ.get("COLAB_T4_MODEL") or saved.get("model_repo") or DEFAULT_MODEL
-    values["quant"] = getattr(options, "quant", None) or os.environ.get("COLAB_T4_QUANT") or saved.get("quant") or DEFAULT_QUANT
-    values["port"] = getattr(options, "port", None) or int(os.environ.get("COLAB_T4_PORT", saved.get("port", DEFAULT_PORT)))
-    values["ctx"] = getattr(options, "ctx", None) or int(os.environ.get("COLAB_T4_CTX", saved.get("ctx", DEFAULT_CTX)))
+    values["session"] = getattr(options, "session", None) or os.environ.get("COLAB_T4_SESSION") or saved_session or DEFAULT_HOSTNAME
+    values["model"] = getattr(options, "model", None) or os.environ.get("COLAB_T4_MODEL") or saved_model or DEFAULT_MODEL
+    values["quant"] = getattr(options, "quant", None) or os.environ.get("COLAB_T4_QUANT") or saved_quant or DEFAULT_QUANT
+    values["port"] = getattr(options, "port", None) or int(os.environ.get("COLAB_T4_PORT", saved_port))
+    values["ctx"] = getattr(options, "ctx", None) or int(os.environ.get("COLAB_T4_CTX", saved_ctx))
     values["exec_timeout"] = getattr(options, "exec_timeout", None) or float(os.environ.get("COLAB_T4_EXEC_TIMEOUT", 7200))
     values["ready_timeout"] = float(os.environ.get("COLAB_T4_READY_TIMEOUT", 900))
     values["tailnet"] = os.environ.get("TS_TAILNET", saved.get("tailnet", ""))
     values["tailscale_authkey"] = os.environ.get("TS_AUTHKEY", saved.get("tailscale_authkey", ""))
     values["hf_token"] = os.environ.get("HF_TOKEN", saved.get("hf_token", ""))
-    values["api_key"] = getattr(options, "api_key", None) or os.environ.get("COLAB_T4_API_KEY", saved.get("api_key", ""))
+    values["api_key"] = api_key
     values["ssh_mode"] = getattr(options, "ssh_mode", None) or os.environ.get("COLAB_T4_SSH_MODE", saved.get("ssh_mode", "tailscale"))
     values["ssh_password"] = getattr(options, "password", None) or os.environ.get("COLAB_T4_SSH_PASSWORD", saved.get("ssh_password", ""))
     values["ssh_pubkey"] = ""
@@ -169,7 +201,7 @@ def collect(
     if not values["api_key"]:
         print("No API key was provided.")
         if _yes("Generate a secure API key automatically?", input_fn=input_fn):
-            values["api_key"] = generated_api_key()
+            values["api_key"] = config.generated_api_key()
             values["api_key_origin"] = "generated"
         else:
             values["api_key"] = _secret("Enter API key", getpass_fn=getpass_fn)
@@ -183,6 +215,8 @@ def collect(
     values["ready_timeout"] = float(_ask("Readiness timeout seconds", default=str(values["ready_timeout"]), input_fn=input_fn))
     values["persist_secrets"] = _persistence_choice(input_fn)
     return values
+
+
 def _persistence_choice(input_fn: Input = input) -> bool:
     print("Use entered secrets for:")
     print("  1. This run only (recommended)")
@@ -192,27 +226,49 @@ def _persistence_choice(input_fn: Input = input) -> bool:
         if choice in {"1", "2"}:
             return choice == "2"
         print("Enter 1 or 2.")
+
+
 def persist(values: dict[str, Any]) -> None:
     if not values.get("persist_secrets"):
         return
-    save_secrets({
+    runtime_id = config.selected_runtime()
+    if runtime_id == "default":
+        config.save_secrets({
+            "tailscale_authkey": values.get("tailscale_authkey", ""),
+            "tailnet": values.get("tailnet", ""),
+            "hf_token": values.get("hf_token", ""),
+            "api_key": values.get("api_key", ""),
+            "ssh_mode": values.get("ssh_mode", "tailscale"),
+            "ssh_password": values.get("ssh_password", ""),
+            "ssh_pubkey": values.get("ssh_pubkey", ""),
+            "model_repo": values.get("model", DEFAULT_MODEL),
+            "quant": values.get("quant", DEFAULT_QUANT),
+            "session": values.get("session", DEFAULT_HOSTNAME),
+            "port": str(values.get("port", DEFAULT_PORT)),
+            "ctx": str(values.get("ctx", DEFAULT_CTX)),
+        })
+        return
+
+    config.update_saved_secrets({
         "tailscale_authkey": values.get("tailscale_authkey", ""),
         "tailnet": values.get("tailnet", ""),
         "hf_token": values.get("hf_token", ""),
-        "api_key": values.get("api_key", ""),
         "ssh_mode": values.get("ssh_mode", "tailscale"),
         "ssh_password": values.get("ssh_password", ""),
         "ssh_pubkey": values.get("ssh_pubkey", ""),
+    })
+    update_runtime_metadata(runtime_id, {
+        "session": values.get("session", DEFAULT_HOSTNAME),
         "model_repo": values.get("model", DEFAULT_MODEL),
         "quant": values.get("quant", DEFAULT_QUANT),
-        "session": values.get("session", DEFAULT_HOSTNAME),
-        "port": str(values.get("port", DEFAULT_PORT)),
-        "ctx": str(values.get("ctx", DEFAULT_CTX)),
     })
+    api_key = str(values.get("api_key") or "")
+    if api_key:
+        config.save_runtime_api_key(api_key)
 
 
 def configure_status() -> dict[str, bool | str]:
-    saved = load_secrets()
+    saved = config.load_secrets()
     return {
         "tailscale_authkey": bool(saved.get("tailscale_authkey")),
         "tailnet": bool(saved.get("tailnet")),
@@ -228,6 +284,5 @@ def reset(*, yes: bool, input_fn: Input = input) -> None:
     if not yes and interactive_available(False) and not _yes("Delete saved colab-t4 credentials?", default=False, input_fn=input_fn):
         print("Reset cancelled.")
         return
-    clear_saved = __import__("colab_t4.config", fromlist=["clear_secrets"]).clear_secrets
-    clear_saved()
+    config.clear_secrets()
     print("Saved credentials removed.")
