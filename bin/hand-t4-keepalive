@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# hand-t4-keepalive: resolve the live hand-t4 Colab session endpoint across
+# known account HOMEs, then exec `colab keep-alive` to hold it.
+# Runs as hand-t4-keepalive.service (Restart=always): re-resolves after the
+# 24h keep-alive expiry or a rebuild, exits 1 when no session exists yet.
+set -u
+COLAB=/root/.local/bin/colab
+SESSION=hand-t4
+for profile in browser-profile-4 browser-profile-5 browser-profile-6 browser-profile-7 browser-profile-8 default; do
+  AHOME=/root/.config/colab-t4/accounts/$profile
+  [ -d "$AHOME" ] || continue
+  out=$(HOME="$AHOME" timeout 60 "$COLAB" status --session "$SESSION" 2>/dev/null) || continue
+  ep=$(printf '%s' "$out" | grep -oE 'gpu-t4-s-[A-Za-z0-9-]+' | head -n 1)
+  if [ -n "$ep" ]; then
+    export HOME="$AHOME"
+    exec "$COLAB" keep-alive "$ep" "$SESSION"
+  fi
+done
+echo "hand-t4-keepalive: no live hand-t4 session found" >&2
+exit 1

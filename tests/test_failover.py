@@ -23,6 +23,12 @@ class FakeCLI:
     def new_command(self, session, gpu):
         return ["colab", "new", "--session", session, "--gpu", gpu]
 
+    def sessions_command(self):
+        return ["colab", "sessions"]
+
+    def prune_stale_sessions(self):
+        return ColabCLI("colab", "0.6.0", home=self.home).prune_stale_sessions()
+
     def upload_command(self, session, local, remote):
         return ["colab", "upload", "--session", session, str(local), remote]
 
@@ -55,6 +61,29 @@ class FakeCLI:
                 },
             }))
         return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def test_up_prunes_dead_local_session_registry_before_new(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TS_AUTHKEY", "tskey-test-only")
+    home = tmp_path / "home"
+    registry = home / ".config" / "colab-cli"
+    registry.mkdir(parents=True)
+    (registry / "sessions.json").write_text(json.dumps({
+        "willnotrefuse-t4": {
+            "name": "willnotrefuse-t4", "keep_alive_pid": 987654321,
+            "url": "https://stale.example", "token": "secret",
+        }
+    }))
+    add_account("a", home=str(home))
+
+    monkeypatch.setattr(lifecycle.os, "kill", lambda pid, signal: (_ for _ in ()).throw(ProcessLookupError))
+    monkeypatch.setattr(lifecycle.ColabCLI, "discover", classmethod(lambda cls, home=None: FakeCLI(home=home)))
+    monkeypatch.setattr(lifecycle, "authenticate_available", lambda home=None: True)
+
+    lifecycle.up(options(account="a"))
+
+    assert json.loads((registry / "sessions.json").read_text()) == {}
 
 
 def options(**overrides):

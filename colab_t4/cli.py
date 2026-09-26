@@ -20,7 +20,7 @@ from . import __version__
 from . import services
 from .accounts import account_home_dir, add_account, get_account, load_accounts, next_account_id, remove_account, resolve_account_email
 from .backend import ColabCLI, ColabCLIError, import_token
-from .config import _atomic_json, load_secrets, load_state, logs_dir, redact, save_runtime_api_key, state_dir
+from .config import _atomic_json, generated_api_key, load_secrets, load_state, logs_dir, redact, save_runtime_api_key, state_dir
 from .notebook import DEFAULT_CTX, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
 from .router import serve as router_serve
 from .lifecycle import doctor as lifecycle_doctor
@@ -181,7 +181,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         print(f"colab cli: {result.get('colab_cli') or 'unavailable'}")
-        print(f"auth     : {'configured' if result.get('auth', {}).get('available') else 'not configured'}")
+        auth = result.get("auth") or {}
+        print(f"auth     : {'configured' if auth.get('available') else 'not configured'}")
         for name, ok in result.get("checks", {}).items():
             print(f"{name:16} {'ok' if ok else 'FAIL'}")
         if result.get("error"):
@@ -392,6 +393,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         router_serve(host=host, port=port)
     except (RuntimeError, OSError) as exc:
+        fail(redact(str(exc)))
+    return 0
+
+
+def cmd_supervise(args: argparse.Namespace) -> int:
+    from . import supervisor
+
+    try:
+        # A planned quota rotation removes the old runtime key.  Keep the
+        # stable local-router contract by minting a replacement automatically.
+        if not os.environ.get("COLAB_T4_API_KEY") and not load_secrets().get("api_key"):
+            os.environ["COLAB_T4_API_KEY"] = generated_api_key()
+        values = collect(args, force=False, allow_prompt=False)
+        for key, value in values.items():
+            setattr(args, key, value)
+        persist(values)
+        save_runtime_api_key(values["api_key"])
+        supervisor.run(args, host=_resolve_serve_host(getattr(args, "host", None), False), router_port=args.router_port, interval=args.interval, max_runtime_seconds=float(args.max_runtime_minutes) * 60)
+    except (RuntimeError, ColabCLIError, TimeoutError) as exc:
         fail(redact(str(exc)))
     return 0
 
@@ -778,6 +798,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow binding serve to a non-local, non-Tailscale address",
     )
+    supervise = sub.add_parser("supervise", help="run the router and keep an authenticated Colab runtime ready")
+    supervise.add_argument("--host", default=None)
+    supervise.add_argument("--router-port", type=int, default=8089)
+    supervise.add_argument("--interval", type=float, default=15.0)
+    supervise.add_argument("--max-runtime-minutes", type=float, default=290.0)
+    supervise.add_argument("--session", default=None)
+    supervise.add_argument("--account", default=None)
+    supervise.add_argument("--account-only", action="store_true")
+    supervise.add_argument("--model", default=None)
+    supervise.add_argument("--quant", default=None)
+    supervise.add_argument("--port", type=int, default=None)
+    supervise.add_argument("--ctx", type=int, default=None)
+    supervise.add_argument("--api-key")
+    supervise.add_argument("--ssh-mode", choices=["tailscale", "password", "key"], default=None)
+    supervise.add_argument("--password")
+    supervise.add_argument("--pubkey")
+    supervise.add_argument("--exec-timeout", type=float, default=None)
+    supervise.add_argument("--non-interactive", action="store_true", default=True)
+    supervise.add_argument("--yes", action="store_true", default=True)
     restart = sub.add_parser("restart", help="stop and recreate the runtime")
     restart.add_argument("--session", default=None)
     restart.add_argument("--account", default=None, help="try this registered Google account first")
@@ -835,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "ssh":
         return cmd_ssh(argv[1:])
     args = build_parser().parse_args(argv)
-    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "serve": cmd_serve, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
+    handlers = {"up": cmd_up, "status": cmd_status, "wait": cmd_wait, "down": cmd_down, "serve": cmd_serve, "supervise": cmd_supervise, "restart": cmd_restart, "api": cmd_api, "logs": cmd_logs, "doctor": cmd_doctor, "configure": cmd_configure, "accounts": cmd_accounts}
     return handlers[args.command](args)
 
 

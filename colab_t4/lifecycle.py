@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import sys
 import tempfile
 import time
@@ -22,7 +23,8 @@ from .config import (
     save_secrets,
     save_state,
 )
-from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT, build_notebook
+from .notebook import DEFAULT_CTX, DEFAULT_HOSTNAME, DEFAULT_MODEL, DEFAULT_PORT, DEFAULT_QUANT
+from .upstream_notebook import build_notebook
 
 REMOTE_SECRET = "/content/.colab-t4-secrets.json"
 REMOTE_NOTEBOOK = "/content/colab-t4.ipynb"
@@ -174,7 +176,10 @@ def _download_ready(
         return None
     try:
         value = json.loads(target.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
+        if isinstance(value, dict):
+            shutil.copyfile(target, logs_dir() / "runtime-ready-last.json")
+            return value
+        return None
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -241,6 +246,7 @@ def _provision(
         raise RuntimeError(
             f"account '{account.id}' has no Colab CLI authentication; run `colab-t4 accounts add`"
         )
+    cli.prune_stale_sessions()
     notebook_fd, notebook_name = tempfile.mkstemp(prefix="colab-t4-", suffix=".ipynb")
     os.close(notebook_fd)
     notebook = Path(notebook_name)
@@ -282,7 +288,7 @@ def _provision(
             _update(runtime_state="failed", last_error="readiness artifact missing or smoke test failed")
             raise ColabCLIError("remote provisioning completed without a valid readiness artifact")
         record_success(account.id)
-        state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), runtime=ready.get("runtime", "llama-cpp-python"), llama_cpp_commit=ready.get("llama_cpp_commit"), llama_cpp_python_version=ready.get("llama_cpp_python_version"), native_error=ready.get("native_error"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
+        state = _update(runtime_state="ready", accelerator="T4", gpu=ready.get("gpu"), tailscale_ip=ready.get("tailscale_ip"), api_base=ready.get("api_base"), model=ready.get("model"), model_alias=ready.get("model_alias"), runtime=ready.get("runtime", "llama-cpp-python"), llama_cpp_commit=ready.get("llama_cpp_commit"), llama_cpp_python_version=ready.get("llama_cpp_python_version"), native_error=ready.get("native_error"), ssh_mode=ready.get("ssh_mode", remote_config.get("ssh_mode", "tailscale")), tests=ready.get("tests"), last_error=None, ready_at=now())
         return state
     except KeyboardInterrupt:
         _update(runtime_state="interrupted", last_error="interrupted by user")
@@ -338,6 +344,9 @@ def down(cancelled: CancellationCallback | None = None) -> None:
     if not session:
         clear_runtime_api_key()
         return
+    import traceback
+    print(f"colab-t4 down() stopping session '{session}' at {now()}", file=sys.stderr, flush=True)
+    traceback.print_stack()
     cli = ColabCLI.discover(home=_account_home(state))
     result = cli.run(cli.stop_command(session), _log("colab"), timeout=120, secrets=_secret_values())
     _check_cancelled(cancelled)

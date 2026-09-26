@@ -16,6 +16,9 @@ class FakeCLI:
     def new_command(self, session, gpu):
         return ["colab", "new", "--session", session, "--gpu", gpu]
 
+    def prune_stale_sessions(self):
+        return []
+
     def upload_command(self, session, local, remote):
         return ["colab", "upload", "--session", session, str(local), remote]
 

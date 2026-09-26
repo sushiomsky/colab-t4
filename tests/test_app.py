@@ -62,6 +62,22 @@ def test_discover_colab_cli(monkeypatch):
     assert found.version == "0.6.0"
 
 
+def test_prune_stale_sessions_removes_dead_keep_alive_process(tmp_path, monkeypatch):
+    registry = tmp_path / ".config" / "colab-cli"
+    registry.mkdir(parents=True)
+    (registry / "sessions.json").write_text(json.dumps({
+        "stale": {"keep_alive_pid": 123, "token": "secret"},
+        "external": {"keep_alive_pid": None, "token": "secret"},
+    }))
+    monkeypatch.setattr("colab_t4.backend.os.kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError))
+
+    pruned = ColabCLI("colab", "0.6.0", home=str(tmp_path)).prune_stale_sessions()
+
+    assert pruned == ["stale"]
+    saved = json.loads((registry / "sessions.json").read_text())
+    assert list(saved) == ["external"]
+
+
 def test_ssh_forwarding(monkeypatch, tmp_path):
     import colab_t4.cli as cli
     monkeypatch.setattr(cli, "load_state", lambda: {"session": "colab-t4", "tailscale_ip": "100.64.0.2"})
@@ -77,6 +93,16 @@ def test_status_unknown_is_nonzero(tmp_path, monkeypatch):
     result, code = cli._status()
     assert result["runtime_state"] == "unknown"
     assert code != 0
+
+
+def test_doctor_handles_missing_auth_details(monkeypatch, capsys):
+    from colab_t4 import cli
+
+    monkeypatch.setattr(cli.services, "run_doctor", lambda *, interactive: ({"checks": {}}, 1))
+    monkeypatch.setattr(cli, "interactive_available", lambda requested: False)
+
+    assert cli.cmd_doctor(type("Args", (), {"json": False, "interactive": False})()) == 1
+    assert "not configured" in capsys.readouterr().out
 
 
 def test_api_request_uses_v1_base_and_health_root(monkeypatch):

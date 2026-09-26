@@ -62,6 +62,137 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+# ---------------------------------------------------------------------------
+# Idle detection: record last inference use, wake a fresh runtime on demand.
+# ---------------------------------------------------------------------------
+
+#: Inference paths that count as "the runtime is in use" and can wake one.
+INFERENCE_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+})
+
+#: How long the router holds an inference request while a woken runtime
+#: boots (seconds). Bootstrap takes ~30-45 min; 45 min default keeps the
+#: first request alive for a full provision. 0 disables holding (immediate
+#: 503, runtime still boots in the background). Overridable via
+#: COLAB_T4_WAKE_WAIT_SECONDS.
+_WAKE_POLL_INTERVAL_S = 15.0
+
+
+def _wake_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("COLAB_T4_WAKE_WAIT_SECONDS", "2700")))
+    except ValueError:
+        return 2700.0
+
+#: Idle TTL: no rebuild and no keep-alive-worthy runtime when the last
+#: inference use is older than this (seconds). Default 2h, overridable via
+#: COLAB_T4_IDLE_TTL_SECONDS.
+def idle_ttl_seconds() -> int:
+    try:
+        return max(60, int(os.environ.get("COLAB_T4_IDLE_TTL_SECONDS", "7200")))
+    except ValueError:
+        return 7200
+
+#: Header the keeper sets on its synthetic health probes so they are not
+#: mistaken for real usage (they must not refresh last_used_at).
+KEEPER_PROBE_HEADER = "X-Colab-T4-Keeper-Probe"
+
+
+def _is_keeper_probe(headers: dict[str, str]) -> bool:
+    for key, value in headers.items():
+        if key.lower() == KEEPER_PROBE_HEADER.lower() and str(value).strip() == "1":
+            return True
+    return False
+
+
+#: Wake signal: file the router touches when an inference request arrives
+#: rebuilds even when the idle TTL has expired (unless explicitly disabled
+#: via COLAB_T4_WAKE_ENABLED=0).
+def _wake_signal_path() -> str:
+    from .config import state_dir
+    return str(state_dir() / "wake-requested")
+
+
+def _utcnow_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def record_activity() -> None:
+    """Stamp the last inference use into state (best-effort, never raises)."""
+    try:
+        from .config import load_state, save_state
+        state = load_state()
+        state["last_used_at"] = _utcnow_iso()
+        save_state(state)
+    except Exception:
+        pass
+
+
+def last_used_age_seconds(now: float | None = None) -> float | None:
+    """Age of the last inference use in seconds, or None when never used."""
+    try:
+        from .config import load_state
+        from datetime import datetime, timezone
+        raw = load_state().get("last_used_at")
+        if not raw:
+            return None
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        base = now if now is not None else time.time()
+        return max(0.0, base - stamp.timestamp())
+    except Exception:
+        return None
+
+
+def is_idle() -> bool:
+    """True when the last inference use is older than the idle TTL."""
+    age = last_used_age_seconds()
+    if age is None:
+        return False
+    return age > idle_ttl_seconds()
+
+
+def request_wake(reason: str = "inference") -> bool:
+    """Signal the keeper to provision a runtime (best-effort, never raises)."""
+    if os.environ.get("COLAB_T4_WAKE_ENABLED", "1") == "0":
+        return False
+    try:
+        path = _wake_signal_path()
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"{_utcnow_iso()} {reason}\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def consume_wake_signal() -> str | None:
+    """Take a pending wake request; returns its payload or None."""
+    try:
+        path = _wake_signal_path()
+        with open(path, encoding="utf-8") as handle:
+            payload = handle.read().strip()
+        os.unlink(path)
+        return payload or "wake"
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def peek_wake_signal() -> str | None:
+    """Return a pending wake request without consuming it."""
+    try:
+        with open(_wake_signal_path(), encoding="utf-8") as handle:
+            return (handle.read().strip() or "wake")
+    except (FileNotFoundError, OSError):
+        return None
+
 
 class _RequestRejected(Exception):
     def __init__(self, status: int, message: str):
@@ -87,6 +218,7 @@ class Backend:
     base_url: str
     api_key: str = ""
     healthy: bool = True
+    model_id: str = ""
 
 
 def discover_backends() -> list[Backend]:
@@ -101,8 +233,9 @@ def discover_backends() -> list[Backend]:
     api_base = state.get("api_base")
     if api_base:
         secrets = load_secrets()
-        key = secrets.get("api_key", "")
-        backends.append(Backend(name="colab", base_url=api_base, api_key=key, healthy=True))
+        key = "" if state.get("runtime") == "ollama" else secrets.get("api_key", "")
+        model_id = str(state.get("model_alias") or ("omp-colab-model" if state.get("runtime") == "ollama" else "local"))
+        backends.append(Backend(name="colab", base_url=api_base, api_key=key, healthy=True, model_id=model_id))
     ollama_url = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE")
     if ollama_url:
         backends.append(Backend(name="ollama", base_url=ollama_url.rstrip("/"), healthy=True))
@@ -113,7 +246,7 @@ def discover_backends() -> list[Backend]:
 
 def _probe_backend(backend: Backend) -> bool:
     """Return True when the backend's models endpoint responds with data."""
-    url = backend.base_url.rstrip("/") + "/v1/models"
+    url = _backend_url(backend.base_url, "/v1/models")
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     if backend.api_key:
         req.add_header("Authorization", "Bearer " + backend.api_key)
@@ -123,6 +256,14 @@ def _probe_backend(backend: Backend) -> bool:
             return bool(data.get("data"))
     except Exception:
         return False
+
+
+def _backend_url(base_url: str, path: str) -> str:
+    """Join an upstream base that may already include the OpenAI /v1 prefix."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        return base + path[3:]
+    return base + path
 
 
 def select_backend(backends: list[Backend]) -> Backend | None:
@@ -173,10 +314,48 @@ class Router:
         """
         backend = self.select()
         if backend is None:
+            if path in INFERENCE_PATHS and not _is_keeper_probe(headers):
+                record_activity()
+                woke = request_wake("inference")
+                # Wake-on-first-use: hold the connection while the keeper
+                # provisions (bootstrap takes ~30-45 min). Poll with a
+                # bounded wait so the client eventually gets either a
+                # live backend or a clear 503 to retry later.
+                wait_s = _wake_wait_seconds()
+                if woke and wait_s > 0:
+                    backend = self._wait_for_backend(wait_s)
+                    if backend is not None:
+                        return self._forward_to_backend(backend, method, path, body, headers)
             return 503, {"Content-Type": "application/json"}, json.dumps(
                 {"error": {"message": "no healthy backend available", "type": "router_error"}}
             ).encode()
-        url = backend.base_url.rstrip("/") + path
+        if path in INFERENCE_PATHS and not _is_keeper_probe(headers):
+            record_activity()
+        return self._forward_to_backend(backend, method, path, body, headers)
+
+    def _wait_for_backend(self, wait_s: float) -> Backend | None:
+        """Poll for a healthy backend until the wake-wait budget is spent."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while time.monotonic() < deadline:
+            time.sleep(_WAKE_POLL_INTERVAL_S)
+            try:
+                backend = self.select()
+            except Exception:
+                backend = None
+            if backend is not None:
+                return backend
+        return None
+
+    def _forward_to_backend(self, backend: Backend, method: str, path: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, dict[str, Any], bytes]:
+        url = _backend_url(backend.base_url, path)
+        if body and backend.model_id and path in {"/v1/chat/completions", "/v1/completions"}:
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict) and payload.get("model") in {"local", "default"}:
+                    payload["model"] = backend.model_id
+                    body = json.dumps(payload).encode("utf-8")
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
         forward_headers: dict[str, str] = {}
         hop_by_hop = set(HOP_BY_HOP_HEADERS)
         for value in headers.get("Connection", "").split(","):
@@ -186,8 +365,10 @@ class Router:
         for key, value in headers.items():
             if key.lower() in {"host", "content-length"} | hop_by_hop:
                 continue
+            if not backend.api_key and key.lower() == "authorization":
+                continue
             forward_headers[key] = value
-        if backend.api_key and "Authorization" not in forward_headers:
+        if backend.api_key:
             forward_headers["Authorization"] = "Bearer " + backend.api_key
         req = urllib.request.Request(url, data=body, method=method, headers=forward_headers)
         try:
@@ -1611,8 +1792,7 @@ def serve(host: str = "127.0.0.1", port: int = 8089, backends: list[Backend] | N
     proxy API. The OI-compatible proxy endpoints (``/v1/*``) and the management
     endpoints (``/api/*``, ``/manage``) are multiplexed on the same port.
     """
-    router = Router(backends=backends)
-    server = ThreadingHTTPServer((host, port), _management_handler_factory(router))
+    server = start_router(host, port, backends=backends)
     print(f"colab-t4 router listening on {host}:{port}")
     print(f"  proxy: /v1/* -> OpenAI-compatible API")
     print(f"  health: /health")
@@ -1623,3 +1803,9 @@ def serve(host: str = "127.0.0.1", port: int = 8089, backends: list[Backend] | N
         pass
     finally:
         server.server_close()
+
+
+def start_router(host: str, port: int, backends: list[Backend] | None = None) -> ThreadingHTTPServer:
+    """Create, but do not start, the combined proxy and management server."""
+    router = Router(backends=backends)
+    return ThreadingHTTPServer((host, port), _management_handler_factory(router))

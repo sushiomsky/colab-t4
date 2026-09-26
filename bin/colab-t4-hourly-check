@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -u
+
+STATE_DIR=/root/.config/colab-t4
+SUPERVISOR=colab-t4-supervise.service
+HERMES=hermes-gateway.service
+ROUTER=http://127.0.0.1:8089
+PYTHON=/root/colab-t4/.venv/bin/python
+
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# NOTE: colab-t4-supervise is RETIRED (replaced by hand-t4-keeper + router).
+# Never restart it: its startup path wipes /root/.config/colab-t4/state.json
+# and takes the router down. Recovery is owned by hand-t4-keeper.timer.
+if ! systemctl --user is-active --quiet "$SUPERVISOR"; then
+    log "supervisor $SUPERVISOR is retired; leaving it stopped (keeper owns recovery)"
+fi
+
+runtime_state=$(
+    COLAB_T4_STATE_DIR="$STATE_DIR" "$PYTHON" -c \
+        'from colab_t4.config import load_state; print(load_state().get("runtime_state", "unknown"))' \
+        2>/dev/null || printf 'unknown'
+)
+health_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$ROUTER/health" 2>/dev/null || printf '000')
+
+if [ "$health_code" != 200 ]; then
+    # A 503 is expected while the supervisor is provisioning or rotating a
+    # runtime. Restart only when a ready runtime has actually gone unhealthy.
+    if [ "$runtime_state" = ready ]; then
+        log "ready runtime has unhealthy router (HTTP $health_code); keeper owns recovery, not restarting retired supervisor"
+    else
+        log "router HTTP $health_code while runtime state is $runtime_state; supervisor is recovering"
+    fi
+else
+    models_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$ROUTER/v1/models" 2>/dev/null || printf '000')
+    if [ "$models_code" != 200 ] && [ "$runtime_state" = ready ]; then
+        log "ready runtime models check failed (HTTP $models_code); keeper owns recovery, not restarting retired supervisor"
+    else
+        log "router healthy (health=$health_code models=$models_code state=$runtime_state)"
+    fi
+fi
+
+if ! systemctl --user is-active --quiet "$HERMES"; then
+    log "Hermes gateway inactive; restarting it"
+    systemctl --user restart "$HERMES"
+else
+    log "Hermes gateway active"
+fi

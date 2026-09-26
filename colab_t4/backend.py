@@ -13,15 +13,17 @@ commands and preserve their output in redacted local logs.
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .config import redact
+from .config import _atomic_json, redact
 
 VERSION_RE = re.compile(r"Version:\s*([^\s]+)")
 
@@ -66,6 +68,38 @@ class ColabCLI:
 
     def sessions_command(self) -> list[str]:
         return self.command("sessions")
+
+    def prune_stale_sessions(self) -> list[str]:
+        """Remove local session records whose keep-alive process is gone.
+
+        The Colab CLI keeps a local registry in the account HOME. A crashed
+        keep-alive process can leave records behind and make a later
+        ``colab new`` look like an already-assigned session. Records without
+        a PID are retained because they may still represent a live remote
+        session managed outside this process.
+        """
+        base = Path(self.home) if self.home else Path.home()
+        registry = base / ".config" / "colab-cli" / "sessions.json"
+        try:
+            value = json.loads(registry.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(value, dict):
+            return []
+        stale: list[str] = []
+        for name, session in value.items():
+            if not isinstance(session, dict) or session.get("keep_alive_pid") is None:
+                continue
+            try:
+                pid = int(session["keep_alive_pid"])
+                os.kill(pid, 0)
+            except (TypeError, ValueError, ProcessLookupError, PermissionError):
+                stale.append(str(name))
+        if stale:
+            for name in stale:
+                value.pop(name, None)
+            _atomic_json(registry, value, mode=0o600)
+        return stale
 
     def auth_log_path(self) -> Path:
         return Path(os.environ.get("COLAB_T4_AUTH_LOG", "/tmp/colab-t4-colab-auth.log"))
@@ -118,6 +152,7 @@ class ColabCLI:
             raise ColabCLIError(f"Colab CLI command timed out: {args[1:]}") from exc
         output = redact((result.stdout or "") + (result.stderr or ""), secrets)
         with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()))
             handle.write(f"$ {' '.join(args[1:])}\n")
             handle.write(output)
             if output and not output.endswith("\n"):

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -u
+
+LOCK=/run/user/0/colab-t4-hourly-codex-repair.lock
+LOG_DIR=/root/.config/colab-t4/logs
+PROMPT=/root/colab-t4/ops/hourly-codex-repair-prompt.md
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+LOG="$LOG_DIR/hourly-codex-repair-$STAMP.jsonl"
+SUMMARY="$LOG_DIR/hourly-codex-repair-$STAMP.summary.txt"
+
+mkdir -p "$LOG_DIR"
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+
+printf '%s\n' "Starting hourly Codex reliability session: $STAMP" >> "$LOG"
+codex exec \
+  --cd /root/colab-t4 \
+  --add-dir /root/ablitbot \
+  --add-dir /root/.hermes \
+  --add-dir /root/.openclaw \
+  --add-dir /root/openclaw \
+  --add-dir /root/agentic-company \
+  --add-dir /root/.omniroute \
+  --dangerously-bypass-approvals-and-sandbox \
+  --ephemeral \
+  --color never \
+  --json \
+  --output-last-message "$SUMMARY" \
+  < "$PROMPT" >> "$LOG" 2>&1
+rc=$?
+if grep -q -E 'usage limit|rate limit|429|Upgrade to Plus' "$LOG"; then
+  printf '%s\n' "Codex reliability session deferred (quota/rate limit); exit 0 to avoid failed-unit noise" >> "$LOG"
+  exit 0
+fi
+printf '%s\n' "Codex reliability session exit=$rc" >> "$LOG"
+exit "$rc"

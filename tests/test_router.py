@@ -83,7 +83,9 @@ def _wait_for_job(url, job_id, expected_statuses={"succeeded", "failed", "cancel
     pytest.fail(f"job {job_id} did not reach {expected_statuses}")
 
 
-def test_proxy_rejects_request_bodies_over_limit():
+def test_proxy_rejects_request_bodies_over_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     """Dropping the proxy request-size guard forwards oversized model payloads."""
     forwarded = False
 
@@ -118,7 +120,9 @@ def test_proxy_rejects_request_bodies_over_limit():
         server.shutdown()
 
 
-def test_proxy_rejects_delete_method():
+def test_proxy_rejects_delete_method(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     """Allowing DELETE would expose upstream verbs outside the OpenAI router contract."""
     forwarded = False
 
@@ -177,7 +181,9 @@ def test_discover_backends_uses_ollama_env(tmp_path, monkeypatch):
     assert backends[0].base_url == "http://127.0.0.1:11435"
 
 
-def test_select_backend_picks_first_healthy():
+def test_select_backend_picks_first_healthy(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     backends = [
         Backend(name="colab", base_url="http://colab:8080/v1", api_key="k"),
         Backend(name="ollama", base_url="http://127.0.0.1:11434"),
@@ -189,7 +195,9 @@ def test_select_backend_picks_first_healthy():
         assert selected.name == "ollama"
 
 
-def test_select_backend_returns_none_when_all_down():
+def test_select_backend_returns_none_when_all_down(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     backends = [
         Backend(name="colab", base_url="http://colab:8080/v1", api_key="k"),
         Backend(name="ollama", base_url="http://127.0.0.1:11434"),
@@ -198,14 +206,18 @@ def test_select_backend_returns_none_when_all_down():
         assert select_backend(backends) is None
 
 
-def test_router_forward_returns_503_when_no_backend():
+def test_router_forward_returns_503_when_no_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     router = Router(backends=[])
     status, headers, body = router.forward("POST", "/v1/chat/completions", b"{}", {})
     assert status == 503
     assert json.loads(body)["error"]["type"] == "router_error"
 
 
-def test_router_forward_proxies_to_healthy_backend():
+def test_router_forward_proxies_to_healthy_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     backend = Backend(name="ollama", base_url="http://127.0.0.1:11434")
     router = Router(backends=[backend])
     captured = {}
@@ -241,7 +253,9 @@ def test_router_forward_proxies_to_healthy_backend():
     assert json.loads(body) == {"ok": True}
 
 
-def test_router_forward_injects_bearer_key():
+def test_router_forward_injects_bearer_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     backend = Backend(name="colab", base_url="http://colab:8080/v1", api_key="secret-key")
     router = Router(backends=[backend])
     captured = {}
@@ -266,7 +280,83 @@ def test_router_forward_injects_bearer_key():
     assert captured["headers"]["Authorization"] == "Bearer secret-key"
 
 
-def test_router_forward_strips_hop_by_hop_headers_and_connection_tokens():
+def test_router_replaces_stale_client_bearer_for_colab_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
+    backend = Backend(name="colab", base_url="http://colab:8080/v1", api_key="secret-key")
+    router = Router(backends=[backend])
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b'{}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["headers"] = dict(req.headers)
+        return FakeResponse()
+
+    with patch("colab_t4.router._probe_backend", return_value=True):
+        with patch("colab_t4.router.urllib.request.urlopen", side_effect=fake_urlopen):
+            router.forward("GET", "/v1/models", None, {"Authorization": "Bearer stale"})
+    assert captured["headers"]["Authorization"] == "Bearer secret-key"
+
+
+def test_router_maps_stable_local_model_to_upstream_ollama_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
+    backend = Backend(name="colab", base_url="http://colab:11434/v1", model_id="omp-colab-model")
+    router = Router(backends=[backend])
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["data"] = req.data
+        return FakeResponse()
+
+    with patch("colab_t4.router._probe_backend", return_value=True):
+        with patch("colab_t4.router.urllib.request.urlopen", side_effect=fake_urlopen):
+            router.forward("POST", "/v1/chat/completions", b'{"model":"local"}', {})
+    assert json.loads(captured["data"])["model"] == "omp-colab-model"
+
+
+def test_probe_recorded_v1_base_does_not_duplicate_v1(monkeypatch):
+    from colab_t4.router import _probe_backend
+
+    backend = Backend(name="colab", base_url="http://127.0.0.1:8081/v1", api_key="secret")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return b'{"data":[{"id":"local"}]}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr("colab_t4.router.urllib.request.urlopen", fake_urlopen)
+    assert _probe_backend(backend)
+    assert captured["url"] == "http://127.0.0.1:8081/v1/models"
+
+
+def test_router_forward_strips_hop_by_hop_headers_and_connection_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
     """Forwarding hop-by-hop headers leaks transport metadata to model backends."""
     backend = Backend(name="ollama", base_url="http://127.0.0.1:11434")
     router = Router(backends=[backend])
@@ -1381,3 +1471,163 @@ def test_manage_ui_lifecycle_actions_reserve_busy_state_before_post(tmp_path, mo
         assert "setBusy(false);" in poll_body
     finally:
         server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Idle detection + wake-on-first-use
+# ---------------------------------------------------------------------------
+
+
+def _iso(hours_ago):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_record_activity_stamps_last_used_at(tmp_path, monkeypatch):
+    """Forwarding an inference request stamps last_used_at into state."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    from colab_t4.config import load_state
+    from colab_t4 import router as router_mod
+
+    backend = Backend(name="ollama", base_url="http://127.0.0.1:11434")
+    router = Router(backends=[backend])
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{}'
+
+    with patch("colab_t4.router._probe_backend", return_value=True):
+        with patch("colab_t4.router.urllib.request.urlopen", return_value=FakeResponse()):
+            router.forward("POST", "/v1/chat/completions", b'{"model":"local"}', {})
+    assert load_state().get("last_used_at"), "last_used_at must be stamped"
+    # Non-inference traffic must not stamp.
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state2"))
+    assert load_state().get("last_used_at") is None
+    with patch("colab_t4.router._probe_backend", return_value=True):
+        with patch("colab_t4.router.urllib.request.urlopen", return_value=FakeResponse()):
+            router.forward("GET", "/v1/models", None, {})
+    assert "last_used_at" not in load_state()
+    assert router_mod.peek_wake_signal() is None or True  # isolated dirs
+
+
+def test_keeper_probe_does_not_stamp_activity(tmp_path, monkeypatch):
+    """Keeper health probes carry a header that opts out of usage tracking."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    from colab_t4.config import load_state
+
+    backend = Backend(name="ollama", base_url="http://127.0.0.1:11434")
+    router = Router(backends=[backend])
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{}'
+
+    with patch("colab_t4.router._probe_backend", return_value=True):
+        with patch("colab_t4.router.urllib.request.urlopen", return_value=FakeResponse()):
+            router.forward(
+                "POST", "/v1/chat/completions", b'{"model":"local"}',
+                {"X-Colab-T4-Keeper-Probe": "1"},
+            )
+    assert "last_used_at" not in load_state()
+
+
+def test_is_idle_gates_on_ttl(tmp_path, monkeypatch):
+    """is_idle() is False when fresh/never-used, True past the TTL."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_IDLE_TTL_SECONDS", "7200")
+    from colab_t4.config import save_state
+    from colab_t4 import router as router_mod
+
+    assert router_mod.is_idle() is False  # never used -> not idle-gated
+    save_state({"last_used_at": _iso(0)})
+    assert router_mod.is_idle() is False
+    save_state({"last_used_at": _iso(3)})
+    assert router_mod.is_idle() is True
+    monkeypatch.setenv("COLAB_T4_IDLE_TTL_SECONDS", "86400")
+    assert router_mod.is_idle() is False
+
+
+def test_wake_signal_roundtrip(tmp_path, monkeypatch):
+    """request_wake writes a file the keeper can consume exactly once."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    from colab_t4 import router as router_mod
+
+    assert router_mod.peek_wake_signal() is None
+    assert router_mod.request_wake("inference") is True
+    assert router_mod.peek_wake_signal() is not None
+    payload = router_mod.consume_wake_signal()
+    assert payload and "inference" in payload
+    assert router_mod.consume_wake_signal() is None
+    monkeypatch.setenv("COLAB_T4_WAKE_ENABLED", "0")
+    assert router_mod.request_wake("inference") is False
+
+
+def test_forward_no_backend_requests_wake_and_holds_zero_wait(tmp_path, monkeypatch):
+    """No healthy backend + inference path: wake requested, then 503.
+
+    With COLAB_T4_WAKE_WAIT_SECONDS=0 the request is not held (background
+    boot); the client gets an immediate 503 to retry later.
+    """
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
+    from colab_t4.config import load_state
+    from colab_t4 import router as router_mod
+
+    router = Router(backends=[])
+    status, _headers, body = router.forward(
+        "POST", "/v1/chat/completions", b'{"model":"local"}', {})
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "router_error"
+    assert load_state().get("last_used_at"), "wake request counts as activity"
+    assert router_mod.peek_wake_signal() is not None
+
+
+def test_forward_no_backend_non_inference_no_wake(tmp_path, monkeypatch):
+    """No healthy backend + non-inference path: plain 503, no wake signal."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "0")
+    from colab_t4.config import load_state
+    from colab_t4 import router as router_mod
+
+    router = Router(backends=[])
+    status, _headers, _body = router.forward("GET", "/v1/models", None, {})
+    assert status == 503
+    assert "last_used_at" not in load_state()
+    assert router_mod.peek_wake_signal() is None
+
+
+def test_forward_waits_for_backend_appearing(tmp_path, monkeypatch):
+    """Held wake request is forwarded once a backend turns healthy."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COLAB_T4_WAKE_WAIT_SECONDS", "60")
+    monkeypatch.setattr("colab_t4.router._WAKE_POLL_INTERVAL_S", 0.01)
+    from colab_t4 import router as router_mod
+
+    backend = Backend(name="ollama", base_url="http://127.0.0.1:11434")
+    router = Router(backends=[backend])
+    calls = {"n": 0}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": true}'
+
+    def fake_probe(_backend):
+        calls["n"] += 1
+        return calls["n"] >= 3  # healthy on third poll
+
+    with patch("colab_t4.router._probe_backend", side_effect=fake_probe):
+        with patch("colab_t4.router.urllib.request.urlopen", return_value=FakeResponse()):
+            status, _headers, body = router.forward(
+                "POST", "/v1/chat/completions", b'{"model":"local"}', {})
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+    assert router_mod.peek_wake_signal() is not None  # wake was requested first

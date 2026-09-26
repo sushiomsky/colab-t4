@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# hand-t4 keeper: keep the hand-built Colab T4 backend alive, rebuild on the
+# next Google profile when the VM dies or a profile is exhausted.
+# Runs as a systemd oneshot (see hand-t4-keeper.service/.timer). Concurrent
+# runs serialize on a flock; most ticks exit in seconds via the health check.
+set -u
+
+STATE_DIR=/root/.config/colab-t4
+KEEPER_JSON=$STATE_DIR/keeper.json
+LOCK=/run/user/0/hand-t4-keeper.lock
+COLAB=/root/.local/bin/colab
+VENV_PY=/root/colab-t4/.venv/bin/python
+ROUTER=http://127.0.0.1:8089
+# Hub model to pull on the VM, and the serving name OMP/router actually use.
+# qwen-coder-16k is created on-VM from PULL_MODEL via Modelfile (num_ctx 16384).
+# PULL_MODEL must be tool-calling capable: abliterated Qwen2.5-coder quants emit
+# text pseudo-tool-calls, not OpenAI tool_calls (breaks OMP agent loop).
+PULL_MODEL=huihui_ai/qwen3-abliterated:14b-v2
+MODEL=qwen-coder-16k
+SESSION=hand-t4
+PROFILES="browser-profile-4 browser-profile-5 browser-profile-6 browser-profile-7 browser-profile-8 browser-profile-9 default"
+MAX_FAILS=3
+
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" ; }
+acct_home() { if [ "$1" = default ]; then printf '/root'; else printf '/root/.config/colab-t4/accounts/%s' "$1"; fi; }
+
+exec 9>"$LOCK"
+flock -n 9 || { log "another keeper run active; skipping"; exit 0; }
+
+fails=$($VENV_PY -c "import json; print(json.load(open('$KEEPER_JSON')).get('fails',0))" 2>/dev/null || echo 0)
+current=$($VENV_PY -c "import json; print(json.load(open('$KEEPER_JSON')).get('account','browser-profile-5'))" 2>/dev/null || echo browser-profile-5)
+
+# 1. Health check: router must serve the Colab backend; a tiny chat proves inference.
+# Tailscale re-keys VM IPs without warning: refresh state from the tailnet first.
+STATE_IP=$($VENV_PY -c "from colab_t4.config import load_state; print(load_state().get('tailscale_ip') or '')" 2>/dev/null)
+LIVE_IP=$(tailscale status 2>/dev/null | awk '/hand-t4/ && !/offline/ {print $1; exit}')
+if [ -n "$LIVE_IP" ] && [ "$LIVE_IP" != "$STATE_IP" ]; then
+  HOME=/root "$VENV_PY" -c "
+import time
+from colab_t4.config import load_state, save_state
+s = load_state()
+s.update({'tailscale_ip': '$LIVE_IP', 'api_base': 'http://$LIVE_IP:11434/v1', 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+save_state(s)" 2>/dev/null && log "tailscale IP changed $STATE_IP -> $LIVE_IP; state updated"
+  sleep 8
+fi
+health=$(curl -sS --max-time 10 "$ROUTER/health" 2>/dev/null || true)
+if echo "$health" | grep -q '"backend": *"colab"'; then
+  # Synthetic probe: KEEPER_PROBE_HEADER keeps this out of usage tracking.
+  chat=$(curl -sS --max-time 90 "$ROUTER/v1/chat/completions" -H 'Content-Type: application/json' \
+    -H 'X-Colab-T4-Keeper-Probe: 1' \
+    -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with exactly: KEEPER_OK"}],"max_tokens":256}' 2>/dev/null || true)
+  if echo "$chat" | grep -q 'KEEPER_OK'; then
+    [ "$fails" != 0 ] && $VENV_PY -c "import json; d=json.load(open('$KEEPER_JSON')); d['fails']=0; json.dump(d, open('$KEEPER_JSON','w'))" 2>/dev/null
+    # 1a. Idle shutdown: a healthy but long-unused runtime is stopped so it
+    # does not burn Colab quota; the next real request wakes a fresh one.
+    IDLE_NOW=$($VENV_PY -c "from colab_t4.router import is_idle; print('idle' if is_idle() else 'active')" 2>/dev/null || echo active)
+    if [ "$IDLE_NOW" = idle ]; then
+      log "healthy but idle (no inference use within TTL); stopping runtime"
+      old_session=$($VENV_PY -c "from colab_t4.config import load_state; print(load_state().get('session') or '')" 2>/dev/null)
+      old_account=$($VENV_PY -c "from colab_t4.config import load_state; print(load_state().get('account') or '')" 2>/dev/null)
+      if [ -n "$old_session" ] && [ -n "$old_account" ]; then
+        HOME=$(acct_home "$old_account") timeout 120 "$COLAB" stop --session "$old_session" >/dev/null 2>&1 || true
+      fi
+      HOME=/root "$VENV_PY" -c "
+from colab_t4.config import load_state, save_state
+s = load_state(); s['runtime_state'] = 'idle-stopped'; save_state(s)" 2>/dev/null || true
+      log "runtime stopped (idle); will rebuild on first request"
+      exit 0
+    fi
+    log "healthy (chat OK)"
+    exit 0
+  fi
+fi
+fails=$((fails + 1))
+$VENV_PY -c "import json; d=json.load(open('$KEEPER_JSON')) if True else {}; d['fails']=$fails; json.dump(d, open('$KEEPER_JSON','w'))" 2>/dev/null || \
+  printf '{"fails":%s,"account":"%s"}' "$fails" "$current" > "$KEEPER_JSON"
+log "unhealthy ($fails/$MAX_FAILS)"
+[ "$fails" -lt "$MAX_FAILS" ] && exit 0
+
+# 1b. Idle gate: without recent real use, do NOT rebuild. A dead runtime
+# after the idle TTL simply stays down until a wake request arrives.
+# The wake signal (touched by the router on real inference traffic, never
+# by keeper probes) overrides the idle state exactly once.
+IDLE_CHECK=$($VENV_PY -c "from colab_t4.router import is_idle; print('idle' if is_idle() else 'active')" 2>/dev/null || echo active)
+WAKE_REQ=""
+if [ -f "$STATE_DIR/wake-requested" ]; then
+  WAKE_REQ=$(cat "$STATE_DIR/wake-requested" 2>/dev/null | head -n 1)
+fi
+if [ "$IDLE_CHECK" = idle ] && [ -z "$WAKE_REQ" ]; then
+  log "idle (no inference use within TTL); not rebuilding, runtime stays down until first request"
+  exit 0
+fi
+if [ -n "$WAKE_REQ" ]; then
+  rm -f "$STATE_DIR/wake-requested"
+  log "wake requested ($WAKE_REQ); rebuilding despite idle state"
+fi
+
+# 2. Rebuild: round-robin profiles starting after the current one.
+ordered=$(printf '%s' "$PROFILES" | tr ' ' '\n' | awk -v cur="$current" '
+  {ids[NR]=$1} END {s=1; for(i=1;i<=NR;i++) if(ids[i]==cur) s=i%NR+1; for(k=0;k<NR;k++) print ids[(s+k-1)%NR+1]}')
+# Stop the recorded session best-effort (it is usually already dead server-side).
+old_session=$($VENV_PY -c "from colab_t4.config import load_state; print(load_state().get('session') or '')" 2>/dev/null)
+old_account=$($VENV_PY -c "from colab_t4.config import load_state; print(load_state().get('account') or '')" 2>/dev/null)
+if [ -n "$old_session" ] && [ -n "$old_account" ]; then
+  HOME=$(acct_home "$old_account") timeout 60 "$COLAB" stop --session "$old_session" >/dev/null 2>&1 || true
+fi
+
+for profile in $ordered; do
+  AHOME=$(acct_home "$profile")
+  log "trying profile $profile"
+  if ! HOME=$AHOME timeout 280 "$COLAB" new --session "$SESSION" --gpu T4 2>&1 | tail -n 2 | grep -q READY; then
+    log "profile $profile cannot create T4 (quota?); next"
+    continue
+  fi
+  # Bake bootstrap (key embedded via python, never echoed) and upload.
+  # Serving variant is appended afterwards via heredoc (keeper vars expand
+  # now; the VM evaluates the rest at bootstrap time).
+  if ! HOME=/root "$VENV_PY" -c "
+from colab_t4.config import load_secrets
+key = load_secrets()['tailscale_authkey']
+s = open('/root/.hermes/skills/colab-t4-runtime/scripts/bootstrap-vm.sh').read()
+s = 'export TS_AUTHKEY=' + key + '\nexport OLLAMA_MODEL=$PULL_MODEL\n' + s
+open('/tmp/keeper-bs.sh','w').write(s)"; then
+    log "could not read tailscale key; aborting"
+    exit 1
+  fi
+  cat >> /tmp/keeper-bs.sh <<BOOTSTRAP_APPEND
+# Serving variant: the model OMP actually queries. The hub modelfile pins
+# num_ctx 8192 (server env and per-request options are ignored), so build a
+# 16K variant on-VM. Baked names below were expanded by the keeper.
+printf 'FROM %s\nPARAMETER num_ctx 16384\n' "$PULL_MODEL" > /tmp/Modelfile-serve
+export OLLAMA_HOST=127.0.0.1:11434
+ollama create "$MODEL" -f /tmp/Modelfile-serve || exit 1
+ollama stop "$PULL_MODEL" >/dev/null 2>&1 || true
+BOOTSTRAP_APPEND
+  chmod 600 /tmp/keeper-bs.sh
+  HOME=$AHOME timeout 100 "$COLAB" upload --session "$SESSION" /tmp/keeper-bs.sh /tmp/bs-run.sh >/dev/null 2>&1 || continue
+  cat > /tmp/keeper-wrap.py <<'PYEOF'
+import subprocess
+r = subprocess.run(["bash", "/tmp/bs-run.sh"], capture_output=True, text=True, timeout=3000)
+print("RC:", r.returncode)
+print("TAIL:", (r.stdout or "")[-800:])
+PYEOF
+  if ! HOME=$AHOME timeout 3100 "$COLAB" exec --session "$SESSION" --file /tmp/keeper-wrap.py --timeout 3000 >/tmp/keeper-exec.log 2>&1; then
+    log "bootstrap exec failed on $profile; next"
+    continue
+  fi
+  # Resolve the new Tailscale IP (hostname may gain a -N suffix on collision).
+  NEWIP=$(for i in 1 2 3; do
+    HOME=$AHOME timeout 120 "$COLAB" exec --session "$SESSION" --file /dev/stdin --timeout 90 <<'PYEOF' 2>/dev/null | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+import subprocess
+r = subprocess.run(["tailscale", "--socket=/run/tailscale/tailscaled.sock", "ip", "-4"], capture_output=True, text=True, timeout=30)
+print((r.stdout or "").strip())
+PYEOF
+    sleep 20
+  done)
+  [ -z "$NEWIP" ] && { log "no tailscale IP on $profile; next"; continue; }
+  # Direct smoke test (first model load is slow: retry before abandoning).
+  smoke=""
+  for attempt in 1 2 3; do
+    smoke=$(curl -sS --max-time 300 "http://$NEWIP:11434/v1/chat/completions" -H 'Content-Type: application/json' \
+      -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with exactly: KEEPER_OK"}],"max_tokens":256}' 2>/dev/null || true)
+    echo "$smoke" | grep -q 'KEEPER_OK' && break
+    log "smoke attempt $attempt failed on $NEWIP; waiting"
+    sleep 60
+  done
+  if ! echo "$smoke" | grep -q 'KEEPER_OK'; then
+    log "smoke test failed on $NEWIP; next"
+    continue
+  fi
+  HOME=/root "$VENV_PY" -c "
+import time
+from colab_t4.config import load_state, save_state
+s = load_state(); now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+s.update({'runtime_state':'ready','session':'$SESSION','account':'$profile','accelerator':'T4','gpu':'Tesla T4',
+ 'tailscale_ip':'$NEWIP','api_base':'http://$NEWIP:11434/v1','model':'$MODEL','model_alias':'$MODEL',
+ 'runtime':'ollama','ssh_mode':'tailscale',
+ 'tests':{'health':True,'models':True,'chat':True,'cuda_offload':True,'tailscale_ssh':True},
+ 'last_error':None,'started_at':now,'ready_at':now,'updated_at':now})
+save_state(s)"
+  printf '{"fails":0,"account":"%s"}' "$profile" > "$KEEPER_JSON"
+  log "rebuilt on $profile ($NEWIP); router picks it up automatically"
+  exit 0
+done
+
+log "all profiles exhausted; will retry next tick"
+exit 1

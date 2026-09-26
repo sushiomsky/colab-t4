@@ -118,6 +118,7 @@ colab-t4 restart  stop the recorded session and create a new one
 colab-t4 down     stop exactly the recorded session; idempotent local cleanup
 colab-t4 doctor   validate Colab CLI, auth, SSH, and Tailscale configuration
 colab-t4 serve    run the local OpenAI-compatible router (Colab/Ollama dispatch)
+colab-t4 supervise run the router and continuously keep an authenticated Colab T4 ready
 ```
 
 For integrations that manage account selection themselves, `up` and `restart`
@@ -270,6 +271,24 @@ Failures are recorded per account in `~/.config/colab-t4/accounts.json`
 requests to a Colab T4 backend (when a ready runtime is recorded) or a local
 Ollama backend as a fallback. This lets bots, tools, and integrations point at
 a single stable endpoint regardless of which backend is currently live.
+
+For an always-on OMP/Hermes backend, authenticate every Google profile first,
+then run the supervisor. It owns the router process, periodically checks
+readiness, and uses account rotation automatically after runtime eviction or
+quota failure:
+
+```bash
+colab-t4 accounts add --id work
+colab-t4 accounts add --id personal
+colab-t4 supervise --session omp-hermes-t4 --model repo/model --quant Q4_K_M
+```
+
+Configure OMP/Hermes once with `http://127.0.0.1:8089/v1` (or set
+`COLAB_T4_ROUTER_BASE`). The router keeps that endpoint stable while its Colab
+upstream changes between authenticated profiles. The checked-out upstream
+notebook is `/tmp/sushiomsky-colab/colab_ollama_tailscale_t4_huggingface_omp_model_selector.ipynb`;
+the supervisor uses the repository’s non-interactive generator so secrets and
+readiness checks work without browser input.
 
 ```bash
 colab-t4 serve
