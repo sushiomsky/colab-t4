@@ -94,6 +94,7 @@ if [ -n "$WAKE_REQ" ]; then
   rm -f "$STATE_DIR/wake-requested"
   log "wake requested ($WAKE_REQ); rebuilding despite idle state"
 fi
+wake_phase() { "$VENV_PY" -c "import sys; from colab_t4.router import set_wake_phase; set_wake_phase(sys.argv[1], sys.argv[2])" "$1" "$2" 2>/dev/null || true; }
 
 # 2. Rebuild: round-robin profiles starting after the current one.
 ordered=$(printf '%s' "$PROFILES" | tr ' ' '\n' | awk -v cur="$current" '
@@ -108,6 +109,7 @@ fi
 for profile in $ordered; do
   AHOME=$(acct_home "$profile")
   log "trying profile $profile"
+  wake_phase "creating-session" "profile $profile"
   if ! HOME=$AHOME timeout 280 "$COLAB" new --session "$SESSION" --gpu T4 2>&1 | tail -n 2 | grep -q READY; then
     log "profile $profile cannot create T4 (quota?); next"
     continue
@@ -135,6 +137,7 @@ ollama stop "$PULL_MODEL" >/dev/null 2>&1 || true
 BOOTSTRAP_APPEND
   chmod 600 /tmp/keeper-bs.sh
   HOME=$AHOME timeout 100 "$COLAB" upload --session "$SESSION" /tmp/keeper-bs.sh /tmp/bs-run.sh >/dev/null 2>&1 || continue
+  wake_phase "bootstrapping" "profile $profile: tailscale+ollama+model"
   cat > /tmp/keeper-wrap.py <<'PYEOF'
 import subprocess
 r = subprocess.run(["bash", "/tmp/bs-run.sh"], capture_output=True, text=True, timeout=3000)
@@ -155,13 +158,22 @@ PYEOF
     sleep 20
   done)
   [ -z "$NEWIP" ] && { log "no tailscale IP on $profile; next"; continue; }
-  # Direct smoke test (first model load is slow: retry before abandoning).
+  wake_phase "loading-model" "$NEWIP: waiting for $MODEL in VRAM"
+  # Direct smoke test. First model load into VRAM is slow (14B ≈ 3-6 min
+  # after pull/create, plus cold ollama serve): poll /api/ps until the
+  # serving variant shows up, then chat. Generous budget before abandoning.
   smoke=""
-  for attempt in 1 2 3; do
-    smoke=$(curl -sS --max-time 300 "http://$NEWIP:11434/v1/chat/completions" -H 'Content-Type: application/json' \
-      -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with exactly: KEEPER_OK"}],"max_tokens":256}' 2>/dev/null || true)
-    echo "$smoke" | grep -q 'KEEPER_OK' && break
-    log "smoke attempt $attempt failed on $NEWIP; waiting"
+  for attempt in $(seq 1 12); do
+    loaded=$(curl -sS --max-time 30 "http://$NEWIP:11434/api/ps" 2>/dev/null || true)
+    if echo "$loaded" | grep -q "\"$MODEL"; then
+      smoke=$(curl -sS --max-time 300 "http://$NEWIP:11434/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with exactly: KEEPER_OK"}],"max_tokens":256}' 2>/dev/null || true)
+      echo "$smoke" | grep -q 'KEEPER_OK' && break
+      log "smoke chat attempt $attempt failed on $NEWIP (model loaded, chat not yet); waiting"
+    else
+      log "smoke attempt $attempt/12 on $NEWIP: model $MODEL not loaded yet; waiting"
+    fi
+    smoke=""
     sleep 60
   done
   if ! echo "$smoke" | grep -q 'KEEPER_OK'; then
@@ -179,9 +191,11 @@ s.update({'runtime_state':'ready','session':'$SESSION','account':'$profile','acc
  'last_error':None,'started_at':now,'ready_at':now,'updated_at':now})
 save_state(s)"
   printf '{"fails":0,"account":"%s"}' "$profile" > "$KEEPER_JSON"
+  wake_phase "ready" "$profile $NEWIP"
   log "rebuilt on $profile ($NEWIP); router picks it up automatically"
   exit 0
 done
 
+wake_phase "failed" "all profiles exhausted; retry next tick"
 log "all profiles exhausted; will retry next tick"
 exit 1

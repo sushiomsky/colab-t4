@@ -168,6 +168,7 @@ def request_wake(reason: str = "inference") -> bool:
             os.chmod(path, 0o600)
         except OSError:
             pass
+        set_wake_phase("queued", reason)
         return True
     except Exception:
         return False
@@ -192,6 +193,68 @@ def peek_wake_signal() -> str | None:
             return (handle.read().strip() or "wake")
     except (FileNotFoundError, OSError):
         return None
+
+
+#: Wake progress phases, in order. The keeper advances through these while
+#: provisioning; clients poll GET /api/wake-status for live updates.
+WAKE_PHASES = (
+    "queued",            # router wrote wake-requested, keeper hasn't picked it up
+    "creating-session",  # colab new --gpu T4 running
+    "bootstrapping",     # tailscale + ollama + model pull on the VM
+    "loading-model",     # smoke: waiting for the serving variant in VRAM
+    "ready",             # backend live, state.json updated
+    "failed",            # all profiles exhausted this tick
+)
+
+_TERMINAL_WAKE_PHASES = frozenset({"ready", "failed"})
+
+
+def _wake_status_path() -> str:
+    from .config import state_dir
+    return str(state_dir() / "wake-status.json")
+
+
+def _write_json_0600(path: str, data: dict) -> bool:
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def wake_status() -> dict:
+    """Current wake progress snapshot ({} when no wake ever requested)."""
+    try:
+        with open(_wake_status_path(), encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def set_wake_phase(phase: str, detail: str = "") -> bool:
+    """Advance the wake progress file (best-effort, never raises)."""
+    if phase not in WAKE_PHASES:
+        return False
+    try:
+        current = wake_status()
+        if current.get("phase") in _TERMINAL_WAKE_PHASES and phase == "queued":
+            pass  # a fresh wake restarts the cycle
+        return _write_json_0600(_wake_status_path(), {
+            "phase": phase,
+            "detail": detail,
+            "updated_at": _utcnow_iso(),
+            "requested_at": current.get("requested_at") or _utcnow_iso(),
+        })
+    except Exception:
+        return False
 
 
 class _RequestRejected(Exception):
@@ -1450,6 +1513,7 @@ _API_GET_EXACT = {
     "/api/doctor",
     "/api/logs",
     "/api/api/models",
+    "/api/wake-status",
 }
 _API_POST_EXACT = {
     "/api/up",
@@ -1652,6 +1716,9 @@ def _management_handler_factory(router: Router):
                     self._json(200, {"status": services.runtime_status()})
                 except Exception as exc:
                     self._json_error(502, exc)
+                return
+            if path == "/api/wake-status":
+                self._json(200, {"wake": wake_status()})
                 return
             if path == "/api/doctor":
                 try:

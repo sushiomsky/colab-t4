@@ -1631,3 +1631,43 @@ def test_forward_waits_for_backend_appearing(tmp_path, monkeypatch):
     assert status == 200
     assert json.loads(body) == {"ok": True}
     assert router_mod.peek_wake_signal() is not None  # wake was requested first
+
+
+def test_wake_status_lifecycle(tmp_path, monkeypatch):
+    """set_wake_phase advances phases; unknown phases are rejected."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    from colab_t4 import router as router_mod
+
+    assert router_mod.wake_status() == {}
+    assert router_mod.set_wake_phase("bogus") is False
+    assert router_mod.set_wake_phase("queued", "inference") is True
+    status = router_mod.wake_status()
+    assert status["phase"] == "queued"
+    assert status["detail"] == "inference"
+    assert status["requested_at"] <= status["updated_at"]
+    assert router_mod.set_wake_phase("ready", "p 1.2.3.4") is True
+    assert router_mod.wake_status()["phase"] == "ready"
+    # A fresh wake restarts the cycle from a terminal phase.
+    assert router_mod.request_wake("inference") is True
+    assert router_mod.wake_status()["phase"] == "queued"
+
+
+def test_wake_status_endpoint(tmp_path, monkeypatch):
+    """GET /api/wake-status exposes the current wake progress."""
+    monkeypatch.setenv("COLAB_T4_STATE_DIR", str(tmp_path / "state"))
+    from colab_t4 import router as router_mod
+
+    router_mod.set_wake_phase("bootstrapping", "profile x")
+    router = Router(backends=[])
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _management_handler_factory(router))
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/wake-status", timeout=5) as resp:
+            body = json.loads(resp.read().decode())
+        assert resp.status == 200
+        assert body["wake"]["phase"] == "bootstrapping"
+        assert body["wake"]["detail"] == "profile x"
+    finally:
+        server.shutdown()
