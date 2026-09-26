@@ -156,13 +156,18 @@ r = subprocess.run(["tailscale", "--socket=/run/tailscale/tailscaled.sock", "ip"
 print((r.stdout or "").strip())
 PYEOF
     sleep 20
-  done)
+  done | head -n 1)
   [ -z "$NEWIP" ] && { log "no tailscale IP on $profile; next"; continue; }
   wake_phase "loading-model" "$NEWIP: waiting for $MODEL in VRAM"
   # Direct smoke test. First model load into VRAM is slow (14B ≈ 3-6 min
   # after pull/create, plus cold ollama serve): poll /api/ps until the
   # serving variant shows up, then chat. Generous budget before abandoning.
   smoke=""
+  # Prime the model: Ollama loads lazily into VRAM, and /api/ps stays empty
+  # until the first inference. Without this the loop below polls forever.
+  wake_phase "loading-model" "$NEWIP: priming $MODEL into VRAM"
+  curl -sS --max-time 600 "http://$NEWIP:11434/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with exactly: KEEPER_OK"}],"max_tokens":256}' 2>/dev/null | grep -q 'KEEPER_OK' && smoke="KEEPER_OK-primed"
   for attempt in $(seq 1 12); do
     loaded=$(curl -sS --max-time 30 "http://$NEWIP:11434/api/ps" 2>/dev/null || true)
     if echo "$loaded" | grep -q "\"$MODEL"; then
