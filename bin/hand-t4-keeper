@@ -15,8 +15,11 @@ ROUTER=http://127.0.0.1:8089
 # qwen-coder-16k is created on-VM from PULL_MODEL via Modelfile (num_ctx 16384).
 # PULL_MODEL must be tool-calling capable: abliterated Qwen2.5-coder quants emit
 # text pseudo-tool-calls, not OpenAI tool_calls (breaks OMP agent loop).
+# EXTRA_PULLS: remaining catalog hub refs, pre-pulled so every serving name is
+# live without a later download (see colab_t4/models.py).
 PULL_MODEL=huihui_ai/qwen3-abliterated:14b-v2
 MODEL=qwen-coder-16k
+EXTRA_PULLS="dolphin3:8b dolphin-mistral:7b wizard-vicuna-uncensored:13b-q4_K_M"
 SESSION=hand-t4
 PROFILES="browser-profile-4 browser-profile-5 browser-profile-6 browser-profile-7 browser-profile-8 browser-profile-9 default"
 MAX_FAILS=3
@@ -121,7 +124,7 @@ for profile in $ordered; do
 from colab_t4.config import load_secrets
 key = load_secrets()['tailscale_authkey']
 s = open('/root/.hermes/skills/colab-t4-runtime/scripts/bootstrap-vm.sh').read()
-s = 'export TS_AUTHKEY=' + key + '\nexport OLLAMA_MODEL=$PULL_MODEL\n' + s
+s = 'export TS_AUTHKEY=' + key + '\nexport OLLAMA_MODEL=$PULL_MODEL\nexport OLLAMA_EXTRA_MODELS="$EXTRA_PULLS"\n' + s
 open('/tmp/keeper-bs.sh','w').write(s)"; then
     log "could not read tailscale key; aborting"
     exit 1
@@ -185,6 +188,17 @@ PYEOF
     log "smoke test failed on $NEWIP; next"
     continue
   fi
+  # Catalog check: every extra pull must answer /api/show (disk-resident).
+  # A missing extra does NOT fail the rebuild — it is logged and re-pulled
+  # on the next rebuild; the primary smoke above already gated readiness.
+  for catalog_model in $EXTRA_PULLS; do
+    if curl -sS --max-time 60 "http://$NEWIP:11434/api/show" -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$catalog_model\"}" 2>/dev/null | grep -q '"model"'; then
+      log "catalog present on $NEWIP: $catalog_model"
+    else
+      log "catalog MISSING on $NEWIP: $catalog_model (re-pull on next rebuild)"
+    fi
+  done
   HOME=/root "$VENV_PY" -c "
 import time
 from colab_t4.config import load_state, save_state
